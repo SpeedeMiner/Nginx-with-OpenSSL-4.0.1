@@ -1,0 +1,85 @@
+name: Build Nginx with OpenSSL 4.0.1
+on: [workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libpcre2-dev \
+            libpcre3-dev \
+            zlib1g-dev \
+            libbrotli-dev \
+            libzstd-dev \
+            git \
+            wget
+
+      - name: Download sources
+        run: |
+          # Клонируем ветку/тег openssl-4.0.1
+          git clone --depth 1 -b openssl-4.0.1 https://github.com/openssl/openssl.git openssl-4.0.1
+          
+          # Скачиваем Nginx 1.31.3
+          wget https://nginx.org/download/nginx-1.31.3.tar.gz
+          tar -zxf nginx-1.31.3.tar.gz
+
+      - name: Configure and Compile Nginx
+        run: |
+          cd nginx-1.31.3
+          ./configure \
+            --prefix=/etc/nginx \
+            --sbin-path=/usr/sbin/nginx \
+            --modules-path=/usr/lib/nginx/modules \
+            --conf-path=/etc/nginx/nginx.conf \
+            --error-log-path=/var/log/nginx/error.log \
+            --http-log-path=/var/log/nginx/access.log \
+            --pid-path=/run/nginx.pid \
+            --lock-path=/run/nginx.lock \
+            --http-client-body-temp-path=/var/cache/nginx/client_temp \
+            --http-proxy-temp-path=/var/cache/nginx/proxy_temp \
+            --http-fastcgi-temp-path=/var/cache/nginx/fastcgi_temp \
+            --http-uwsgi-temp-path=/var/cache/nginx/uwsgi_temp \
+            --http-scgi-temp-path=/var/cache/nginx/scgi_temp \
+            --user=nginx \
+            --group=nginx \
+            --with-compat \
+            --with-file-aio \
+            --with-threads \
+            --with-http_addition_module \
+            --with-http_auth_request_module \
+            --with-http_dav_module \
+            --with-http_flv_module \
+            --with-http_gunzip_module \
+            --with-http_gzip_static_module \
+            --with-http_mp4_module \
+            --with-http_random_index_module \
+            --with-http_realip_module \
+            --with-http_secure_link_module \
+            --with-http_slice_module \
+            --with-http_ssl_module \
+            --with-http_stub_status_module \
+            --with-http_sub_module \
+            --with-http_v2_module \
+            --with-http_v3_module \
+            --with-mail \
+            --with-mail_ssl_module \
+            --with-stream \
+            --with-stream_realip_module \
+            --with-stream_ssl_module \
+            --with-stream_ssl_preread_module \
+            --with-openssl=../openssl-4.0.1 \
+            --with-openssl-opt='enable-zlib enable-brotli enable-zstd' \
+            --with-cc-opt='-g -O2 -Werror=implicit-function-declaration -fstack-protector-strong -fstack-clash-protection -Wformat -Werror=format-security -fcf-protection -fPIC' \
+            --with-ld-opt='-Wl,-z,relro -Wl,-z,now -Wl,--as-needed -pie -lbrotlienc -lbrotlidec -lzstd -lz'
+          
+          make -j$(nproc)
+
+      - name: Upload Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nginx-binary-openssl4
+          path: nginx-1.31.3/objs/nginx
