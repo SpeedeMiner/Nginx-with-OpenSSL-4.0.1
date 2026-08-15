@@ -20,10 +20,7 @@ jobs:
 
       - name: Download sources
         run: |
-          # Клонируем ветку/тег openssl-4.0.1
           git clone --depth 1 -b openssl-4.0.1 https://github.com/openssl/openssl.git openssl-4.0.1
-          
-          # Скачиваем Nginx 1.31.3
           wget https://nginx.org/download/nginx-1.31.3.tar.gz
           tar -zxf nginx-1.31.3.tar.gz
 
@@ -74,7 +71,7 @@ jobs:
             --with-openssl=../openssl-4.0.1 \
             --with-openssl-opt='enable-zlib enable-brotli enable-zstd' \
             --with-cc-opt='-g -O2 -Werror=implicit-function-declaration -fstack-protector-strong -fstack-clash-protection -Wformat -Werror=format-security -fcf-protection -fPIC' \
-            --with-ld-opt='-Wl,-z,relro -Wl,-z,now -Wl,--as-needed -pie -lbrotlienc -lbrotlidec -lzstd -lz'
+            --with-ld-opt='-Wl,-z,relro -Wl,-z,now -pie -Wl,--no-as-needed -lbrotlienc -lbrotlidec -lzstd -lz'
           
           make -j$(nproc)
 
