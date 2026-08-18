@@ -23,7 +23,7 @@ jobs:
       - name: Download sources
         run: |
           git clone --depth 1 -b openssl-4.0.1 https://github.com/openssl/openssl.git openssl-4.0.1
-          git clone --depth 1 https://git.angie.software/angie/angie.git angie-src
+          git clone --depth 1 https://github.com/webserver-llc/angie.git angie-src
 
       - name: Configure and Compile Angie
         run: |
