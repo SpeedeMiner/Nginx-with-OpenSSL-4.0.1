@@ -1,22 +1,32 @@
-name: Build Nginx (main) with OpenSSL (master)
+name: Build Nginx (main) with OpenSSL (master) & GCC 14
 on: [workflow_dispatch]
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    # ubuntu-22.04 (GLIBC 2.35) гарантирует запуск на Ubuntu 22.04, 24.04, Debian 12 и Debian 13
+    runs-on: ubuntu-22.04
+
     steps:
-      - name: Install build dependencies
+      - name: Install Latest GCC and build dependencies
         run: |
           sudo apt-get update
+          sudo apt-get install -y software-properties-common
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
           sudo apt-get install -y \
+            gcc-14 \
+            g++-14 \
             build-essential \
             libpcre2-dev \
-            libpcre3-dev \
             zlib1g-dev \
             libbrotli-dev \
             libzstd-dev \
             git \
             wget
+
+          # Назначаем GCC 14 компилятором по умолчанию
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100 --slave /usr/bin/g++ g++ /usr/bin/g++-14
+          gcc --version
 
       - name: Download sources
         run: |
@@ -26,6 +36,9 @@ jobs:
       - name: Configure and Compile Nginx
         run: |
           cd nginx-main
+          export CC=gcc-14
+          export CXX=g++-14
+
           ./auto/configure \
             --prefix=/etc/nginx \
             --sbin-path=/usr/sbin/nginx \
@@ -70,9 +83,14 @@ jobs:
             --with-openssl=../openssl-main \
             --with-openssl-opt='enable-zlib enable-brotli enable-zstd' \
             --with-cc-opt='-g -O2 -Werror=implicit-function-declaration -fstack-protector-strong -fstack-clash-protection -Wformat -Werror=format-security -fcf-protection -fPIC' \
-            --with-ld-opt='-Wl,-z,relro -Wl,-z,now -pie -Wl,--no-as-needed -lbrotlienc -lbrotlidec -lzstd -lz'
-          
+            --with-ld-opt='-Wl,-z,relro -Wl,-z,now -pie -static-libgcc -Wl,--no-as-needed -lbrotlienc -lbrotlidec -lzstd -lz'
+
           make -j$(nproc)
+
+      - name: Check binary requirements
+        run: |
+          echo "=== Проверка зависимостей GLIBC ==="
+          objdump -p nginx-main/objs/nginx | grep -A 10 "required from libc.so" || true
 
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@v4
