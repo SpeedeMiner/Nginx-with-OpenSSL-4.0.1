@@ -8,11 +8,21 @@ jobs:
 
     steps:
       - name: Install Latest GCC and build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update
+          # 1. Замена нестабильных зеркал Azure на официальные HTTPS-зеркала Ubuntu
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu/|https://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list /etc/apt/sources.list.d/* || true
+
+          # 2. Обновление с жесткими таймаутами на сетевые запросы
+          sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=10
           sudo apt-get install -y software-properties-common
+          
+          # 3. Подключение PPA со свежими версиями GCC
           sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
-          sudo apt-get update
+          sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=10
+          
+          # 4. Установка пакетов сборки
           sudo apt-get install -y \
             gcc-14 \
             g++-14 \
@@ -24,7 +34,7 @@ jobs:
             git \
             wget
 
-          # Назначаем GCC 14 компилятором по умолчанию
+          # 5. Назначаем GCC 14 компилятором по умолчанию
           sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100 --slave /usr/bin/g++ g++ /usr/bin/g++-14
           gcc --version
 
