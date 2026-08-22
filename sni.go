@@ -422,7 +422,8 @@ func main() {
 
 	if *debugIP != "" {
 		fmt.Printf("\n[*] Отладка IP: %s\n", *debugIP)
-		ip, doms := probeIP(*debugIP)
+		// ИСПРАВЛЕНИЕ ТУТ: заменили ip на _ (игнорируем возвращаемый IP)
+		_, doms := probeIP(*debugIP)
 		fmt.Printf("[+] Найденные несовпадающие SNI: %v\n", doms)
 		return
 	}
