@@ -2,17 +2,28 @@
 import argparse
 import asyncio
 import concurrent.futures
+import gc
 import ipaddress
+import itertools
 import json
+import os
 import re
 import socket
 import ssl
 import sys
+import threading
 import time
 import urllib.request
 
+# Уменьшаем размер стека для каждого нового потока (OSINT/PTR) до 512 КБ 
+# для экономии памяти на слабых VPS (1vCPU/1GB)
+try:
+    threading.stack_size(524288)
+except Exception:
+    pass
+
 # ================= НАСТРОЙКИ СКОРОСТИ =================
-CONNECT_TIMEOUT = 0.5  # Оптимально для быстрого пропуска мёртвых IP
+CONNECT_TIMEOUT = 0.5
 MAX_HOSTS_PER_24 = 254
 MAX_SAMPLED_24_PER_LARGE_PREFIX = 4
 
@@ -197,7 +208,26 @@ def build_h2_request_headers(sni):
     return bytes(payload)
 
 
-# ================= BGP & Geo Helpers =================
+# ================= ОСНОВНЫЕ ХЕЛПЕРЫ =================
+
+def get_hardware_defaults():
+    cores = os.cpu_count() or 1
+    mem_mb = 1024
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            for line in f:
+                if line.startswith('MemTotal:'):
+                    mem_mb = int(line.split()[1]) // 1024
+                    break
+    except Exception:
+        pass
+    
+    if mem_mb < 1200: # ~1GB VPS
+        return 50, max(4, cores * 2)
+    elif mem_mb < 2500: # ~2GB VPS
+        return 100, max(8, cores * 4)
+    else: # 4GB+ 
+        return 200, 16
 
 def fetch_ripestat_safe(endpoint, resource, params="", timeout=8):
     try:
@@ -290,20 +320,19 @@ def filter_prefixes_by_country(prefixes, target_country):
                         ip_q = item.get("query")
                         if ip_q in sample_map: matched.add(sample_map[ip_q])
         except Exception:
-            # FAIL-SAFE: При ошибке API отбрасываем чанк, чтобы избежать лавины мусорных IP
             pass
 
-    # max_workers=5 для безопасности, чтобы не поймать 429 Too Many Requests от ip-api.com
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(chunks) or 1)) as ex:
         ex.map(process_chunk, chunks)
 
     return sorted(list(matched))
 
-def generate_scan_ips(prefixes, my_ip, max_ips=0):
-    ip_scan_pool = []
+def iter_scan_ips(prefixes, my_ip, max_ips=0):
+    """Генератор пула IP: решает проблему OOM (не строит списки в памяти) и использует islice"""
     seen = {my_ip}
+    yielded = 0
     for p_str in prefixes:
-        if max_ips > 0 and len(ip_scan_pool) >= max_ips: break
+        if max_ips > 0 and yielded >= max_ips: return
         try:
             net = ipaddress.ip_network(p_str, strict=False)
         except Exception:
@@ -315,23 +344,25 @@ def generate_scan_ips(prefixes, my_ip, max_ips=0):
                 ip_s = str(ip)
                 if ip_s not in seen:
                     seen.add(ip_s)
-                    ip_scan_pool.append(ip_s)
+                    yield ip_s
+                    yielded += 1
                     count += 1
-                    if max_ips > 0 and len(ip_scan_pool) >= max_ips: break
+                    if max_ips > 0 and yielded >= max_ips: return
                     if count >= MAX_HOSTS_PER_24: break
         else:
-            for s in list(net.subnets(new_prefix=24))[:MAX_SAMPLED_24_PER_LARGE_PREFIX]:
-                if max_ips > 0 and len(ip_scan_pool) >= max_ips: break
+            # Использование itertools.islice вместо [:] предотвращает аллокацию всех /24 подсетей (бомба для /8)
+            for s in itertools.islice(net.subnets(new_prefix=24), MAX_SAMPLED_24_PER_LARGE_PREFIX):
+                if max_ips > 0 and yielded >= max_ips: return
                 count = 0
                 for ip in s.hosts():
                     ip_s = str(ip)
                     if ip_s not in seen:
                         seen.add(ip_s)
-                        ip_scan_pool.append(ip_s)
+                        yield ip_s
+                        yielded += 1
                         count += 1
-                        if max_ips > 0 and len(ip_scan_pool) >= max_ips: break
+                        if max_ips > 0 and yielded >= max_ips: return
                         if count >= MAX_HOSTS_PER_24: break
-    return ip_scan_pool
 
 
 # ================= Strict Domain Validation & ASN.1 =================
@@ -508,25 +539,21 @@ async def check_tls_async(ip_str, hostname):
 async def probe_ip_target_async(ip_str, loop, executor):
     discovered_domains = set()
     
-    # 1. Сбор PTR
     ptr_doms = await loop.run_in_executor(executor, get_ptr_domains, ip_str)
     discovered_domains.update(ptr_doms)
 
-    # 2. Прямой TLS опрос
     direct_der = await check_tls_async(ip_str, ip_str)
     direct_success = False
     if direct_der:
         discovered_domains.update(parse_x509_der(direct_der))
         direct_success = True
 
-    # 3. PTR-домены
     if ptr_doms:
         async def check_and_add(c):
             c_der = await check_tls_async(ip_str, c)
             if c_der: discovered_domains.update(parse_x509_der(c_der))
         await asyncio.gather(*(check_and_add(c) for c in ptr_doms))
 
-    # 4. OSINT Bypass
     if not direct_success and not discovered_domains:
         is_open = False
         try:
@@ -540,7 +567,6 @@ async def probe_ip_target_async(ip_str, loop, executor):
         if is_open:
             osint_doms = await loop.run_in_executor(executor, get_osint_domains, ip_str)
             if osint_doms:
-                # Опрашиваем по очереди. Как только один подошёл, выходим.
                 for candidate in osint_doms:
                     c_der = await check_tls_async(ip_str, candidate)
                     if c_der:
@@ -648,27 +674,31 @@ async def verify_target_h2_async(ip_str, sni, loop, executor):
     return None
 
 
-async def run_scan(ip_scan_pool, args):
+async def run_scan(target_prefixes, my_ip, args):
     loop = asyncio.get_running_loop()
-    
-    # Пул потоков динамически привязан к concurrency, чтобы избежать очереди (Bottleneck)
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.io_threads)
     concurrency = args.concurrency
 
     # ================= ЭТАП 1: ПРОБИНГ =================
-    queue1 = asyncio.Queue()
-    for ip in ip_scan_pool: queue1.put_nowait(ip)
-    
+    # Ограниченная очередь для защиты от OOM
+    queue1 = asyncio.Queue(maxsize=concurrency * 4)
     found_entries = set()
     done_count = 0
-    total_ips = len(ip_scan_pool)
+
+    async def producer():
+        for ip in iter_scan_ips(target_prefixes, my_ip, args.max_ips):
+            await queue1.put(ip)
+        for _ in range(concurrency):
+            await queue1.put(None)
+
+    producer_task = asyncio.create_task(producer())
 
     async def worker_phase1():
         nonlocal done_count
-        while not queue1.empty():
-            try:
-                ip = queue1.get_nowait()
-            except asyncio.QueueEmpty:
+        while True:
+            ip = await queue1.get()
+            if ip is None:
+                queue1.task_done()
                 break
                 
             ip_str, domains = await probe_ip_target_async(ip, loop, executor)
@@ -676,29 +706,39 @@ async def run_scan(ip_scan_pool, args):
                 found_entries.add((ip_str, d))
                 
             done_count += 1
-            if done_count % 500 == 0 or done_count == total_ips:
-                print(f"\r[*] Этап 1/2: Сбор доменов (ASN.1 + OSINT): {done_count}/{total_ips} ({(done_count/total_ips)*100:.1f}%)", end="", flush=True)
+            if done_count % 100 == 0:
+                print(f"\r[*] Этап 1/2: Сбор доменов (ASN.1 + OSINT): обработано {done_count} IP...", end="", flush=True)
             queue1.task_done()
 
     workers = [asyncio.create_task(worker_phase1()) for _ in range(concurrency)]
-    await asyncio.gather(*workers)
+    await asyncio.gather(producer_task, *workers)
 
-    print(f"\n[+] Извлечено {len(found_entries)} чистых пар [IP <-> SNI].")
+    print(f"\r[*] Этап 1/2: Сбор доменов (ASN.1 + OSINT): завершено, проверено {done_count} IP.    ")
+    print(f"[+] Извлечено {len(found_entries)} чистых пар [IP <-> SNI].")
+
+    # Сборка мусора перед 2 этапом
+    gc.collect()
+
     print("[*] Этап 2/2: Строгая валидация TLS 1.3 + HTTP/2 (HEADERS, DATA, Status)...")
 
     # ================= ЭТАП 2: ВАЛИДАЦИЯ =================
     queue2 = asyncio.Queue()
-    for entry in found_entries: queue2.put_nowait(entry)
+    for entry in found_entries:
+        queue2.put_nowait(entry)
+        
+    for _ in range(concurrency):
+        queue2.put_nowait(None)
     
     valid_targets = []
 
     async def worker_phase2():
-        while not queue2.empty():
-            try:
-                ip, dom = queue2.get_nowait()
-            except asyncio.QueueEmpty:
+        while True:
+            entry = await queue2.get()
+            if entry is None:
+                queue2.task_done()
                 break
                 
+            ip, dom = entry
             res = await verify_target_h2_async(ip, dom, loop, executor)
             if res:
                 valid_targets.append(res)
@@ -715,27 +755,29 @@ def main():
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    # default=100 - безопасное и быстрое значение по умолчанию
+    auto_concurrency, auto_io_threads = get_hardware_defaults()
+
     parser = argparse.ArgumentParser(description="Strict Reality Scanner (Async + OOM Safe + OSINT Bypass)")
     parser.add_argument("-c", "--country", type=str, help="Принудительно код страны (например, RU, US, NL)")
     parser.add_argument("--all", action="store_true", help="Сканировать все подсети ASN без гео-фильтра")
     parser.add_argument("--debug-ip", type=str, help="Отладка конкретного IP (например, 94.156.181.211)")
-    parser.add_argument("-w", "--concurrency", type=int, default=100, help="Количество асинхронных потоков (по умолчанию: 100)")
+    parser.add_argument("-w", "--concurrency", type=int, default=auto_concurrency, help=f"Количество асинхронных потоков (по умолчанию для вашей RAM: {auto_concurrency})")
+    parser.add_argument("--io-threads", type=int, default=auto_io_threads, help=f"Размер пула потоков для блокирующих задач DNS/OSINT (по умолчанию: {auto_io_threads})")
     parser.add_argument("--max-ips", type=int, default=0, help="Жёсткий лимит общего числа сканируемых IP-адресов (0 - без лимита)")
     args = parser.parse_args()
 
     print("=" * 115)
-    print("      RIPE REALITY SCANNER (Async + Safe Memory + OSINT Bypass)")
+    print("      RIPE REALITY SCANNER (Async + Safe Memory + Smart Threads)")
     print("=" * 115)
 
     my_ip = get_public_ip()
     print(f"[*] Внешний IP:        {my_ip}")
-    print(f"[*] Параллелизм:       {args.concurrency} одновременных async-соединений")
+    print(f"[*] Параллелизм:       {args.concurrency} async-tcp | {args.io_threads} io-threads")
 
     if args.debug_ip:
         print(f"\n[*] Точечная проверка IP: {args.debug_ip}")
         loop = asyncio.new_event_loop()
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency)
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.io_threads)
         _, doms = loop.run_until_complete(probe_ip_target_async(args.debug_ip, loop, executor))
         print(f"[+] Обнаружено доменов (ASN.1 + OSINT): {doms}")
         for d in doms:
@@ -771,14 +813,7 @@ def main():
 
     print(f"[+] Подсетей для сканирования: {len(target_prefixes)}")
 
-    ip_scan_pool = generate_scan_ips(target_prefixes, my_ip, args.max_ips)
-    total_ips = len(ip_scan_pool)
-    print(f"[*] Подготовлено {total_ips} IP для сканирования...")
-
-    if total_ips == 0:
-        sys.exit(0)
-
-    valid_targets = asyncio.run(run_scan(ip_scan_pool, args))
+    valid_targets = asyncio.run(run_scan(target_prefixes, my_ip, args))
 
     dedup = {}
     for item in valid_targets:
