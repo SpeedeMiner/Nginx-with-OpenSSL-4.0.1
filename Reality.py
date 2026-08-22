@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import asyncio
 import concurrent.futures
 import ipaddress
 import json
@@ -10,8 +11,8 @@ import sys
 import time
 import urllib.request
 
-CONNECT_TIMEOUT = 2.5
-MAX_WORKERS = 100  # Увеличено для максимальной утилизации Network I/O
+# ================= НАСТРОЙКИ СКОРОСТИ =================
+CONNECT_TIMEOUT = 0.5  # Оптимально для быстрого пропуска мёртвых IP
 MAX_HOSTS_PER_24 = 254
 MAX_SAMPLED_24_PER_LARGE_PREFIX = 4
 
@@ -20,7 +21,7 @@ BANNED_TLDS = {
     "local", "internal", "invalid", "example", "test", "localhost"
 }
 
-# SSL Контексты (Создаются один раз)
+# SSL Контексты
 CTX_RAW = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 CTX_RAW.check_hostname = False
 CTX_RAW.verify_mode = ssl.CERT_NONE
@@ -104,7 +105,6 @@ for sym, (code, bits) in enumerate(HUFFMAN_TABLE):
         curr = curr[bit]
     curr["sym"] = sym
 
-
 def decode_huffman(raw_bytes):
     out = bytearray()
     node = HUFFMAN_TREE
@@ -120,39 +120,31 @@ def decode_huffman(raw_bytes):
                 node = HUFFMAN_TREE
     return out.decode("latin1", errors="ignore")
 
-
 def decode_hpack_int(data, offset, prefix_bits):
     max_prefix = (1 << prefix_bits) - 1
-    if offset >= len(data):
-        return 0, offset
+    if offset >= len(data): return 0, offset
     val = data[offset] & max_prefix
     offset += 1
-    if val < max_prefix:
-        return val, offset
+    if val < max_prefix: return val, offset
     m = 0
     while offset < len(data):
         b = data[offset]
         offset += 1
         val += (b & 0x7F) << m
         m += 7
-        if not (b & 0x80):
-            break
+        if not (b & 0x80): break
     return val, offset
 
-
 def decode_hpack_string(data, offset):
-    if offset >= len(data):
-        return "", offset
+    if offset >= len(data): return "", offset
     huffman = bool(data[offset] & 0x80)
     str_len, offset = decode_hpack_int(data, offset, 7)
-    if offset + str_len > len(data):
-        return "", offset
+    if offset + str_len > len(data): return "", offset
     raw_bytes = data[offset : offset + str_len]
     offset += str_len
     if huffman:
         return decode_huffman(raw_bytes), offset
     return raw_bytes.decode("latin1", errors="ignore"), offset
-
 
 def parse_hpack_headers(payload, flags=0):
     headers = {}
@@ -161,7 +153,6 @@ def parse_hpack_headers(payload, flags=0):
         pad_len = payload[offset] if (flags & 0x08) and offset < len(payload) else 0
         offset += 1 if (flags & 0x08) else 0
         offset += 5 if (flags & 0x20) else 0
-
         end_offset = len(payload) - pad_len if len(payload) >= pad_len else len(payload)
 
         while offset < end_offset:
@@ -190,12 +181,10 @@ def parse_hpack_headers(payload, flags=0):
         pass
     return headers
 
-
 def build_h2_frame(frame_type, flags, stream_id, payload=b""):
     length = len(payload)
     header = length.to_bytes(3, "big") + bytes([frame_type, flags]) + (stream_id & 0x7FFFFFFF).to_bytes(4, "big")
     return header + payload
-
 
 def build_h2_request_headers(sni):
     payload = bytearray([0x82, 0x87, 0x84])  # GET, https, /
@@ -220,21 +209,18 @@ def fetch_ripestat_safe(endpoint, resource, params="", timeout=8):
     except Exception:
         return {}
 
-
 def get_public_ip():
     for service in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
         try:
             req = urllib.request.Request(service, headers={"User-Agent": "curl/7.88.1"})
             with urllib.request.urlopen(req, timeout=4) as resp:
                 ip = resp.read().decode().strip()
-                if ipaddress.ip_address(ip).version == 4:
-                    return ip
+                if ipaddress.ip_address(ip).version == 4: return ip
         except Exception:
             continue
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.connect(("1.1.1.1", 80))
         return s.getsockname()[0]
-
 
 def get_server_country(ip):
     services = [
@@ -246,24 +232,18 @@ def get_server_country(ip):
         try:
             req = urllib.request.Request(url_tmpl.format(ip), headers={"User-Agent": "curl/7.88.1"})
             with urllib.request.urlopen(req, timeout=4) as resp:
-                res = json.loads(resp.read().decode())
-                cc = extractor(res)
-                if cc and len(cc) == 2:
-                    return cc.upper()
+                cc = extractor(json.loads(resp.read().decode()))
+                if cc and len(cc) == 2: return cc.upper()
         except Exception:
             continue
     return None
 
-
 def get_origin_and_network_info(ip):
     net_data = fetch_ripestat_safe("network-info", ip, timeout=6)
     asns = net_data.get("asns", [])
-    if not asns:
-        raise RuntimeError(f"Не удалось получить ASN для IP {ip}")
+    if not asns: raise RuntimeError(f"Не удалось получить ASN для IP {ip}")
     asn = f"AS{asns[0]}" if not str(asns[0]).upper().startswith("AS") else str(asns[0])
-    announced_prefix = net_data.get("prefix")
-    return asn, announced_prefix
-
+    return asn, net_data.get("prefix")
 
 def get_asn_prefixes(asn):
     ris_data = fetch_ripestat_safe("ris-prefixes", asn, "&types=o&af=v4", timeout=6)
@@ -272,18 +252,14 @@ def get_asn_prefixes(asn):
         v4 = prefixes.get("v4", {})
         if isinstance(v4, dict):
             res = v4.get("originating", [])
-            if res:
-                return res
+            if res: return res
         elif isinstance(v4, list) and v4:
             return v4
     ann_data = fetch_ripestat_safe("announced-prefixes", asn, timeout=6)
-    raw_list = ann_data.get("prefixes", [])
-    return [p["prefix"] for p in raw_list if ":" not in p.get("prefix", "")]
-
+    return [p["prefix"] for p in ann_data.get("prefixes", []) if ":" not in p.get("prefix", "")]
 
 def filter_prefixes_by_country(prefixes, target_country):
-    if not target_country or not prefixes:
-        return prefixes
+    if not target_country or not prefixes: return prefixes
     
     sample_map = {}
     batch_payload = []
@@ -309,88 +285,96 @@ def filter_prefixes_by_country(prefixes, target_country):
                 headers={"User-Agent": "curl/7.88.1", "Content-Type": "application/json"}
             )
             with urllib.request.urlopen(req, timeout=6) as resp:
-                res = json.loads(resp.read().decode())
-                for item in res:
+                for item in json.loads(resp.read().decode()):
                     if item.get("status") == "success" and item.get("countryCode", "").upper() == target_country:
                         ip_q = item.get("query")
-                        if ip_q in sample_map:
-                            matched.add(sample_map[ip_q])
-                return
+                        if ip_q in sample_map: matched.add(sample_map[ip_q])
         except Exception:
+            # FAIL-SAFE: При ошибке API отбрасываем чанк, чтобы избежать лавины мусорных IP
             pass
-        # Fallback при ошибке API - добавляем префиксы из чанка
-        for item in chunk:
-            ip_q = item.get("query")
-            if ip_q in sample_map:
-                matched.add(sample_map[ip_q])
 
-    # Параллельный запрос батчей для ускорения
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(20, len(chunks) or 1)) as ex:
+    # max_workers=5 для безопасности, чтобы не поймать 429 Too Many Requests от ip-api.com
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(chunks) or 1)) as ex:
         ex.map(process_chunk, chunks)
 
     return sorted(list(matched))
+
+def generate_scan_ips(prefixes, my_ip, max_ips=0):
+    ip_scan_pool = []
+    seen = {my_ip}
+    for p_str in prefixes:
+        if max_ips > 0 and len(ip_scan_pool) >= max_ips: break
+        try:
+            net = ipaddress.ip_network(p_str, strict=False)
+        except Exception:
+            continue
+            
+        if net.prefixlen >= 24:
+            count = 0  
+            for ip in net.hosts():
+                ip_s = str(ip)
+                if ip_s not in seen:
+                    seen.add(ip_s)
+                    ip_scan_pool.append(ip_s)
+                    count += 1
+                    if max_ips > 0 and len(ip_scan_pool) >= max_ips: break
+                    if count >= MAX_HOSTS_PER_24: break
+        else:
+            for s in list(net.subnets(new_prefix=24))[:MAX_SAMPLED_24_PER_LARGE_PREFIX]:
+                if max_ips > 0 and len(ip_scan_pool) >= max_ips: break
+                count = 0
+                for ip in s.hosts():
+                    ip_s = str(ip)
+                    if ip_s not in seen:
+                        seen.add(ip_s)
+                        ip_scan_pool.append(ip_s)
+                        count += 1
+                        if max_ips > 0 and len(ip_scan_pool) >= max_ips: break
+                        if count >= MAX_HOSTS_PER_24: break
+    return ip_scan_pool
 
 
 # ================= Strict Domain Validation & ASN.1 =================
 
 def clean_domain(dom_str):
-    if not dom_str or not isinstance(dom_str, str):
-        return None
+    if not dom_str or not isinstance(dom_str, str): return None
     dom_str = dom_str.strip().lower().lstrip("*.")
-    if "." not in dom_str or len(dom_str) < 4:
-        return None
-    
-    parts = dom_str.split(".")
-    tld = parts[-1]
-    
-    if not re.match(r"^[a-z]{2,24}$", tld) or tld in BANNED_TLDS:
-        return None
-    
-    if any(c in dom_str for c in " \t\r\n/\\:*?\"'<>|#%&={}~`!@$^()+[]"):
-        return None
-        
+    if "." not in dom_str or len(dom_str) < 4: return None
+    tld = dom_str.split(".")[-1]
+    if not re.match(r"^[a-z]{2,24}$", tld) or tld in BANNED_TLDS: return None
+    if any(c in dom_str for c in " \t\r\n/\\:*?\"'<>|#%&={}~`!@$^()+[]"): return None
     return dom_str
 
-
 def decode_tlv(data, offset):
-    if offset >= len(data):
-        return None
+    if offset >= len(data): return None
     tag = data[offset]
     offset += 1
-    if offset >= len(data):
-        return None
+    if offset >= len(data): return None
     length = data[offset]
     offset += 1
     if length & 0x80:
         nbytes = length & 0x7F
-        if offset + nbytes > len(data):
-            return None
+        if offset + nbytes > len(data): return None
         length = int.from_bytes(data[offset : offset + nbytes], "big")
         offset += nbytes
-    if offset + length > len(data):
-        return None
+    if offset + length > len(data): return None
     val = data[offset : offset + length]
     return tag, val, offset + length
 
-
 def parse_x509_der(der_bytes):
     domains = set()
-    if not der_bytes:
-        return domains
+    if not der_bytes: return domains
     cert_tlv = decode_tlv(der_bytes, 0)
-    if not cert_tlv or cert_tlv[0] != 0x30:
-        return domains
+    if not cert_tlv or cert_tlv[0] != 0x30: return domains
     tbs_tlv = decode_tlv(cert_tlv[1], 0)
-    if not tbs_tlv or tbs_tlv[0] != 0x30:
-        return domains
+    if not tbs_tlv or tbs_tlv[0] != 0x30: return domains
 
     tbs_bytes = tbs_tlv[1]
     offset = 0
     tbs_elements = []
     while offset < len(tbs_bytes):
         tlv = decode_tlv(tbs_bytes, offset)
-        if not tlv:
-            break
+        if not tlv: break
         tbs_elements.append(tlv)
         offset = tlv[2]
 
@@ -398,19 +382,16 @@ def parse_x509_der(der_bytes):
     oid_san = b"\x55\x1d\x11"
     
     for tag, val, _ in tbs_elements:
-        # 1. Subject Common Name (CN, OID 2.5.4.3)
         if tag == 0x30 and oid_cn in val:
             sub_off = 0
             while sub_off < len(val):
                 rdn = decode_tlv(val, sub_off)
-                if not rdn:
-                    break
+                if not rdn: break
                 if oid_cn in rdn[1]:
                     atv_off = 0
                     while atv_off < len(rdn[1]):
                         atv = decode_tlv(rdn[1], atv_off)
-                        if not atv:
-                            break
+                        if not atv: break
                         if oid_cn in atv[1]:
                             cn_str_tlv = decode_tlv(atv[1], 0)
                             if cn_str_tlv:
@@ -419,45 +400,41 @@ def parse_x509_der(der_bytes):
                                     try:
                                         d = clean_domain(cn_val_tlv[1].decode("utf-8", errors="ignore"))
                                         if d: domains.add(d)
-                                    except Exception:
-                                        pass
+                                    except Exception: pass
                         atv_off = atv[2]
                 sub_off = rdn[2]
 
-        # 2. SubjectAltName (SAN, OID 2.5.29.17) -> tag 0x82 (dNSName ONLY)
         elif (tag & 0xC0) == 0x80 and (tag & 0x1F) == 3:
             ext_seq = decode_tlv(val, 0)
             if ext_seq and ext_seq[0] == 0x30:
                 e_off = 0
                 while e_off < len(ext_seq[1]):
                     ext = decode_tlv(ext_seq[1], e_off)
-                    if not ext:
-                        break
+                    if not ext: break
                     if oid_san in ext[1]:
                         ext_elem_off = 0
                         while ext_elem_off < len(ext[1]):
                             elem = decode_tlv(ext[1], ext_elem_off)
-                            if not elem:
-                                break
+                            if not elem: break
                             if elem[0] == 0x04:
                                 san_seq = decode_tlv(elem[1], 0)
                                 if san_seq and san_seq[0] == 0x30:
                                     gn_off = 0
                                     while gn_off < len(san_seq[1]):
                                         gn = decode_tlv(san_seq[1], gn_off)
-                                        if not gn:
-                                            break
-                                        if gn[0] == 0x82:  # Строго dNSName
+                                        if not gn: break
+                                        if gn[0] == 0x82:
                                             try:
                                                 d = clean_domain(gn[1].decode("ascii", errors="ignore"))
                                                 if d: domains.add(d)
-                                            except Exception:
-                                                pass
+                                            except Exception: pass
                                         gn_off = gn[2]
                             ext_elem_off = elem[2]
                     e_off = ext[2]
     return domains
 
+
+# ================= OSINT & Sync Resolvers =================
 
 def get_ptr_domains(ip_str):
     domains = set()
@@ -465,48 +442,43 @@ def get_ptr_domains(ip_str):
         name, aliases, _ = socket.gethostbyaddr(ip_str)
         for h in [name] + aliases:
             d = clean_domain(h)
-            if d:
-                domains.add(d)
+            if d: domains.add(d)
     except Exception:
         pass
     return domains
 
+def get_osint_domains(ip_str):
+    domains = set()
+    try:
+        req = urllib.request.Request(
+            f"https://otx.alienvault.com/api/v1/indicators/IPv4/{ip_str}/passive_dns",
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        )
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            for r in json.loads(resp.read().decode()).get("passive_dns", []):
+                d = clean_domain(r.get("hostname", ""))
+                if d: domains.add(d)
+    except Exception:
+        pass
 
-# ================= Discovery & Verification =================
-
-def probe_ip_target(ip_str):
-    discovered_domains = set()
-    
-    # 1. PTR
-    ptr_doms = get_ptr_domains(ip_str)
-    discovered_domains.update(ptr_doms)
-
-    def check_tls(hostname):
+    if not domains:
         try:
-            with socket.create_connection((ip_str, 443), timeout=CONNECT_TIMEOUT) as sock:
-                with CTX_RAW.wrap_socket(sock, server_hostname=hostname) as ssock:
-                    der = ssock.getpeercert(binary_form=True)
-                    if der:
-                        discovered_domains.update(parse_x509_der(der))
+            req = urllib.request.Request(
+                f"https://rapiddns.io/s/{ip_str}?full=1",
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            )
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                for m in re.findall(r'">([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})</a>', resp.read().decode("utf-8")):
+                    d = clean_domain(m)
+                    if d: domains.add(d)
         except Exception:
             pass
-
-    # 2. Прямой TLS опрос (без SNI)
-    check_tls(ip_str)
-
-    # 3. Дополнительный опрос с найденными через PTR SNI
-    for candidate in ptr_doms:
-        check_tls(candidate)
-
-    return ip_str, discovered_domains
-
+            
+    return list(domains)[:10]
 
 def resolve_domain_safe(domain):
-    # Без DNS_LOCK, словари в Python потокобезопасны. Гонки просто обновят кэш.
     cached = DNS_CACHE.get(domain)
-    if cached is not None:
-        return cached
-
+    if cached is not None: return cached
     ips = []
     for _ in range(2):
         try:
@@ -514,155 +486,260 @@ def resolve_domain_safe(domain):
             break
         except Exception:
             time.sleep(0.04)
-
     DNS_CACHE[domain] = ips
     return ips
 
 
-def verify_target_h2(ip_str, sni):
-    sni = clean_domain(sni)
-    if not sni:
+# ================= Async Discovery & Verification =================
+
+async def check_tls_async(ip_str, hostname):
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip_str, 443, ssl=CTX_RAW, server_hostname=hostname),
+            timeout=CONNECT_TIMEOUT
+        )
+        der = writer.get_extra_info('ssl_object').getpeercert(binary_form=True)
+        writer.close()
+        await writer.wait_closed()
+        return der
+    except Exception:
         return None
 
-    # 1. СТРОГАЯ DNS ПРОВЕРКА
-    resolved_ips = resolve_domain_safe(sni)
+async def probe_ip_target_async(ip_str, loop, executor):
+    discovered_domains = set()
+    
+    # 1. Сбор PTR
+    ptr_doms = await loop.run_in_executor(executor, get_ptr_domains, ip_str)
+    discovered_domains.update(ptr_doms)
+
+    # 2. Прямой TLS опрос
+    direct_der = await check_tls_async(ip_str, ip_str)
+    direct_success = False
+    if direct_der:
+        discovered_domains.update(parse_x509_der(direct_der))
+        direct_success = True
+
+    # 3. PTR-домены
+    if ptr_doms:
+        async def check_and_add(c):
+            c_der = await check_tls_async(ip_str, c)
+            if c_der: discovered_domains.update(parse_x509_der(c_der))
+        await asyncio.gather(*(check_and_add(c) for c in ptr_doms))
+
+    # 4. OSINT Bypass
+    if not direct_success and not discovered_domains:
+        is_open = False
+        try:
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(ip_str, 443), timeout=1.0)
+            writer.close()
+            await writer.wait_closed()
+            is_open = True
+        except Exception:
+            pass
+            
+        if is_open:
+            osint_doms = await loop.run_in_executor(executor, get_osint_domains, ip_str)
+            if osint_doms:
+                # Опрашиваем по очереди. Как только один подошёл, выходим.
+                for candidate in osint_doms:
+                    c_der = await check_tls_async(ip_str, candidate)
+                    if c_der:
+                        discovered_domains.update(parse_x509_der(c_der))
+                        break
+
+    return ip_str, discovered_domains
+
+
+async def verify_target_h2_async(ip_str, sni, loop, executor):
+    sni = clean_domain(sni)
+    if not sni: return None
+
+    resolved_ips = await loop.run_in_executor(executor, resolve_domain_safe, sni)
     if not resolved_ips or (ip_str not in resolved_ips):
         return None
 
-    # 2. Рукопожатие TLS 1.3 + Native HTTP/2
     try:
         t0 = time.perf_counter()
-        with socket.create_connection((ip_str, 443), timeout=CONNECT_TIMEOUT) as sock:
-            with CTX_REALITY.wrap_socket(sock, server_hostname=sni) as ssock:
-                rtt_ms = (time.perf_counter() - t0) * 1000
-                negotiated_alpn = ssock.selected_alpn_protocol()
-                alpn_tag = negotiated_alpn if negotiated_alpn else "h2 (no ALPN)"
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip_str, 443, ssl=CTX_REALITY, server_hostname=sni),
+            timeout=CONNECT_TIMEOUT
+        )
+        rtt_ms = (time.perf_counter() - t0) * 1000
+        
+        ssl_obj = writer.get_extra_info('ssl_object')
+        negotiated_alpn = ssl_obj.selected_alpn_protocol()
+        alpn_tag = negotiated_alpn if negotiated_alpn else "h2 (no ALPN)"
 
-                # Отправляем Client Preface + SETTINGS + HEADERS
-                ssock.sendall(H2_PREFACE)
-                ssock.sendall(build_h2_frame(0x04, 0, 0, b""))  # SETTINGS
-                req_headers = build_h2_request_headers(sni)
-                ssock.sendall(build_h2_frame(0x01, 0x05, 1, req_headers))  # HEADERS (END_STREAM | END_HEADERS)
+        writer.write(H2_PREFACE)
+        writer.write(build_h2_frame(0x04, 0, 0, b""))
+        writer.write(build_h2_frame(0x01, 0x05, 1, build_h2_request_headers(sni)))
+        await writer.drain()
 
-                recv_buf = bytearray()
-                headers_received = {}
-                data_bytes_received = 0
-                is_h2_confirmed = False
-                end_stream_received = False
-                start_recv = time.perf_counter()
+        recv_buf = bytearray()
+        headers_received = {}
+        data_bytes_received = 0
+        is_h2_confirmed = False
+        end_stream_received = False
+        start_recv = time.perf_counter()
 
-                while time.perf_counter() - start_recv < 2.5:
-                    try:
-                        chunk = ssock.recv(8192)
-                    except (socket.timeout, BlockingIOError):
-                        break
-                    
-                    if not chunk:
-                        break
-                    
-                    recv_buf.extend(chunk)
+        while time.perf_counter() - start_recv < 2.5:
+            try:
+                chunk = await asyncio.wait_for(reader.read(8192), timeout=0.5)
+            except (asyncio.TimeoutError, ConnectionError, OSError):
+                break
+                
+            if not chunk: break
+            recv_buf.extend(chunk)
 
-                    if recv_buf.startswith(b"HTTP/1."):
-                        return None
+            if recv_buf.startswith(b"HTTP/1."):
+                writer.close()
+                await writer.wait_closed()
+                return None
 
-                    while len(recv_buf) >= 9:
-                        length = int.from_bytes(recv_buf[0:3], "big")
-                        frame_type = recv_buf[3]
-                        flags = recv_buf[4]
-                        stream_id = int.from_bytes(recv_buf[5:9], "big") & 0x7FFFFFFF
+            while len(recv_buf) >= 9:
+                length = int.from_bytes(recv_buf[0:3], "big")
+                frame_type = recv_buf[3]
+                flags = recv_buf[4]
+                stream_id = int.from_bytes(recv_buf[5:9], "big") & 0x7FFFFFFF
 
-                        if frame_type in (0x00, 0x01, 0x04, 0x07, 0x08):
-                            is_h2_confirmed = True
+                if frame_type in (0x00, 0x01, 0x04, 0x07, 0x08):
+                    is_h2_confirmed = True
 
-                        if len(recv_buf) < 9 + length:
-                            break
+                if len(recv_buf) < 9 + length: break
+                payload = recv_buf[9 : 9 + length]
+                del recv_buf[: 9 + length]
 
-                        payload = recv_buf[9 : 9 + length]
-                        del recv_buf[: 9 + length]
+                if frame_type == 0x04 and not (flags & 0x01):  
+                    writer.write(build_h2_frame(0x04, 0x01, 0, b""))
+                    await writer.drain()
+                elif frame_type == 0x01 and stream_id == 1: 
+                    if flags & 0x01: end_stream_received = True
+                    parsed = parse_hpack_headers(payload, flags)
+                    if parsed: headers_received.update(parsed)
+                elif frame_type == 0x00 and stream_id == 1: 
+                    if flags & 0x01: end_stream_received = True
+                    data_bytes_received += len(payload)
 
-                        if frame_type == 0x04 and not (flags & 0x01):  # SETTINGS -> отвечаем ACK
-                            ssock.sendall(build_h2_frame(0x04, 0x01, 0, b""))
+            if is_h2_confirmed and ":status" in headers_received:
+                if end_stream_received or data_bytes_received > 0 or (time.perf_counter() - start_recv > 0.4):
+                    break
 
-                        elif frame_type == 0x01 and stream_id == 1:  # HEADERS
-                            if flags & 0x01: end_stream_received = True
-                            parsed = parse_hpack_headers(payload, flags)
-                            if parsed:
-                                headers_received.update(parsed)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
 
-                        elif frame_type == 0x00 and stream_id == 1:  # DATA
-                            if flags & 0x01: end_stream_received = True
-                            data_bytes_received += len(payload)
+        if not is_h2_confirmed: return None
 
-                    # Ранний выход: если получен статус, и либо данные, либо закрыт поток
-                    if is_h2_confirmed and ":status" in headers_received:
-                        if end_stream_received or data_bytes_received > 0 or (time.perf_counter() - start_recv > 0.4):
-                            break
-
-                if not is_h2_confirmed:
-                    return None
-
-                return {
-                    "dest": f"{sni}:443",
-                    "sni": sni,
-                    "ip": ip_str,
-                    "rtt": round(rtt_ms, 1),
-                    "tls": "1.3",
-                    "alpn": alpn_tag,
-                    "status": headers_received.get(":status", "200"),
-                    "server": headers_received.get("server", "-"),
-                    "data_bytes": data_bytes_received
-                }
-
+        return {
+            "dest": f"{sni}:443",
+            "sni": sni,
+            "ip": ip_str,
+            "rtt": round(rtt_ms, 1),
+            "tls": "1.3",
+            "alpn": alpn_tag,
+            "status": headers_received.get(":status", "200"),
+            "server": headers_received.get("server", "-"),
+            "data_bytes": data_bytes_received
+        }
     except Exception:
         pass
     return None
 
 
-def generate_scan_ips(prefixes, my_ip):
-    # Оптимизировано с использованием set для гарантии O(1) проверки
-    ip_scan_pool = []
-    seen = set([my_ip])
-    for p_str in prefixes:
-        net = ipaddress.ip_network(p_str, strict=False)
-        if net.prefixlen >= 24:
-            for ip in net.hosts():
-                ip_s = str(ip)
-                if ip_s not in seen:
-                    seen.add(ip_s)
-                    ip_scan_pool.append(ip_s)
-                    if len(ip_scan_pool) % MAX_HOSTS_PER_24 == 0: break # Ускоренный break
-        else:
-            subnets_24 = list(net.subnets(new_prefix=24))
-            sampled_subnets = subnets_24[:MAX_SAMPLED_24_PER_LARGE_PREFIX]
-            for s in sampled_subnets:
-                for ip in s.hosts():
-                    ip_s = str(ip)
-                    if ip_s not in seen:
-                        seen.add(ip_s)
-                        ip_scan_pool.append(ip_s)
-    return ip_scan_pool
+async def run_scan(ip_scan_pool, args):
+    loop = asyncio.get_running_loop()
+    
+    # Пул потоков динамически привязан к concurrency, чтобы избежать очереди (Bottleneck)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency)
+    concurrency = args.concurrency
+
+    # ================= ЭТАП 1: ПРОБИНГ =================
+    queue1 = asyncio.Queue()
+    for ip in ip_scan_pool: queue1.put_nowait(ip)
+    
+    found_entries = set()
+    done_count = 0
+    total_ips = len(ip_scan_pool)
+
+    async def worker_phase1():
+        nonlocal done_count
+        while not queue1.empty():
+            try:
+                ip = queue1.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+                
+            ip_str, domains = await probe_ip_target_async(ip, loop, executor)
+            for d in domains:
+                found_entries.add((ip_str, d))
+                
+            done_count += 1
+            if done_count % 500 == 0 or done_count == total_ips:
+                print(f"\r[*] Этап 1/2: Сбор доменов (ASN.1 + OSINT): {done_count}/{total_ips} ({(done_count/total_ips)*100:.1f}%)", end="", flush=True)
+            queue1.task_done()
+
+    workers = [asyncio.create_task(worker_phase1()) for _ in range(concurrency)]
+    await asyncio.gather(*workers)
+
+    print(f"\n[+] Извлечено {len(found_entries)} чистых пар [IP <-> SNI].")
+    print("[*] Этап 2/2: Строгая валидация TLS 1.3 + HTTP/2 (HEADERS, DATA, Status)...")
+
+    # ================= ЭТАП 2: ВАЛИДАЦИЯ =================
+    queue2 = asyncio.Queue()
+    for entry in found_entries: queue2.put_nowait(entry)
+    
+    valid_targets = []
+
+    async def worker_phase2():
+        while not queue2.empty():
+            try:
+                ip, dom = queue2.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+                
+            res = await verify_target_h2_async(ip, dom, loop, executor)
+            if res:
+                valid_targets.append(res)
+            queue2.task_done()
+
+    workers2 = [asyncio.create_task(worker_phase2()) for _ in range(concurrency)]
+    await asyncio.gather(*workers2)
+
+    executor.shutdown(wait=False)
+    return valid_targets
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Strict Reality Scanner (Clean HTTP/2 & Strict DNS)")
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    # default=100 - безопасное и быстрое значение по умолчанию
+    parser = argparse.ArgumentParser(description="Strict Reality Scanner (Async + OOM Safe + OSINT Bypass)")
     parser.add_argument("-c", "--country", type=str, help="Принудительно код страны (например, RU, US, NL)")
     parser.add_argument("--all", action="store_true", help="Сканировать все подсети ASN без гео-фильтра")
     parser.add_argument("--debug-ip", type=str, help="Отладка конкретного IP (например, 94.156.181.211)")
+    parser.add_argument("-w", "--concurrency", type=int, default=100, help="Количество асинхронных потоков (по умолчанию: 100)")
+    parser.add_argument("--max-ips", type=int, default=0, help="Жёсткий лимит общего числа сканируемых IP-адресов (0 - без лимита)")
     args = parser.parse_args()
 
     print("=" * 115)
-    print("      RIPE REALITY SCANNER (Strict X.509 ASN.1 + Native HTTP/2 Engine)")
+    print("      RIPE REALITY SCANNER (Async + Safe Memory + OSINT Bypass)")
     print("=" * 115)
 
     my_ip = get_public_ip()
     print(f"[*] Внешний IP:        {my_ip}")
+    print(f"[*] Параллелизм:       {args.concurrency} одновременных async-соединений")
 
     if args.debug_ip:
         print(f"\n[*] Точечная проверка IP: {args.debug_ip}")
-        _, doms = probe_ip_target(args.debug_ip)
-        print(f"[+] Обнаружено доменов (ASN.1): {doms}")
+        loop = asyncio.new_event_loop()
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency)
+        _, doms = loop.run_until_complete(probe_ip_target_async(args.debug_ip, loop, executor))
+        print(f"[+] Обнаружено доменов (ASN.1 + OSINT): {doms}")
         for d in doms:
-            res = verify_target_h2(args.debug_ip, d)
+            res = loop.run_until_complete(verify_target_h2_async(args.debug_ip, d, loop, executor))
             print(f"    - Проверка SNI '{d}': {res if res else 'ОТКЛОНЕН'}")
         sys.exit(0)
 
@@ -686,38 +763,22 @@ def main():
         target_prefixes = all_prefixes
     else:
         target_prefixes = filter_prefixes_by_country(all_prefixes, country)
+        if not target_prefixes:
+            print("[-] Гео-фильтр отсёк все префиксы или API недоступно. Сканирование невозможно.")
+            sys.exit(1)
         if announced_prefix and announced_prefix not in target_prefixes:
             target_prefixes.insert(0, announced_prefix)
 
     print(f"[+] Подсетей для сканирования: {len(target_prefixes)}")
 
-    ip_scan_pool = generate_scan_ips(target_prefixes, my_ip)
+    ip_scan_pool = generate_scan_ips(target_prefixes, my_ip, args.max_ips)
     total_ips = len(ip_scan_pool)
     print(f"[*] Подготовлено {total_ips} IP для сканирования...")
 
-    # Используем множества для автоматической дедупликации
-    found_entries = set()
-    done_count = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(probe_ip_target, ip): ip for ip in ip_scan_pool}
-        for f in concurrent.futures.as_completed(futures):
-            done_count += 1
-            if done_count % 500 == 0 or done_count == total_ips:
-                print(f"\r[*] Этап 1/2: Сбор доменов (ASN.1 + PTR): {done_count}/{total_ips} ({(done_count/total_ips)*100:.1f}%)", end="", flush=True)
-            ip_str, domains = f.result()
-            for dom in domains:
-                found_entries.add((ip_str, dom))
+    if total_ips == 0:
+        sys.exit(0)
 
-    print(f"\n[+] Извлечено {len(found_entries)} чистых пар [IP <-> SNI].")
-    print("[*] Этап 2/2: Строгая валидация TLS 1.3 + HTTP/2 (HEADERS, DATA, Status)...")
-
-    valid_targets = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(verify_target_h2, ip, dom) for ip, dom in found_entries]
-        for f in concurrent.futures.as_completed(futures):
-            res = f.result()
-            if res:
-                valid_targets.append(res)
+    valid_targets = asyncio.run(run_scan(ip_scan_pool, args))
 
     dedup = {}
     for item in valid_targets:
@@ -756,7 +817,6 @@ def main():
     print(f'  "{best["sni"]}"')
     print(']')
     print(f"\nПараметры: ALPN: {best['alpn']}, HTTP Status: {best['status']}, Server: {best['server']}, Body: {best['data_bytes']} B, RTT: {best['rtt']} ms")
-
 
 if __name__ == "__main__":
     main()
