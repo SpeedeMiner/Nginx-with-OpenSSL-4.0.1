@@ -488,6 +488,7 @@ func main() {
 	workers := flag.Int("w", 500, "Количество горутин (concurrency)")
 	maxIPs := flag.Int("max-ips", 0, "Лимит IP для скана")
 	debugIP := flag.String("debug-ip", "", "Проверить один IP")
+	vpsIP := flag.String("vps-ip", "", "IP вашего сервера для поиска сети (запуск с ПК)") // ДОБАВЛЕН ФЛАГ
 	flag.Parse()
 
 	fmt.Println(strings.Repeat("=", 115))
@@ -495,6 +496,7 @@ func main() {
 	fmt.Println(strings.Repeat("=", 115))
 
 	if *debugIP != "" {
+		// ... код дебага оставляем как был ...
 		fmt.Printf("\n[*] Отладка IP: %s\n", *debugIP)
 		ip, doms := probeIP(*debugIP)
 		fmt.Printf("[+] Домены (ASN.1 + OSINT): %v\n", doms)
@@ -509,11 +511,19 @@ func main() {
 		return
 	}
 
-	myIP := getPublicIP()
+	// ЛОГИКА ПОДМЕНЫ IP
+	var myIP string
+	if *vpsIP != "" {
+		myIP = *vpsIP
+		fmt.Printf("[*] Используем указанный IP VPS: %s\n", myIP)
+	} else {
+		myIP = getPublicIP()
+		fmt.Printf("[*] Внешний IP (Авто):         %s\n", myIP)
+	}
+
 	asn, prefix := getASNAndPrefix(myIP)
-	fmt.Printf("[*] Внешний IP:        %s\n", myIP)
-	fmt.Printf("[*] Announcing ASN:    %s (Локальный префикс: %s)\n", asn, prefix)
-	fmt.Printf("[*] Параллелизм:       %d горутин\n", *workers)
+	fmt.Printf("[*] Announcing ASN:          %s (Локальный префикс: %s)\n", asn, prefix)
+	fmt.Printf("[*] Параллелизм:             %d горутин\n", *workers)
 
 	allPrefixes := getPrefixes(asn)
 	if len(allPrefixes) == 0 && prefix != "" {
