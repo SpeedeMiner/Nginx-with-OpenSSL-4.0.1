@@ -18,6 +18,14 @@ jobs:
 
     - name: Build binary
       run: |
+        # Инициализируем модуль
+        go mod init reality-scanner
+        
+        # Скачиваем зависимости (utls и hpack)
+        go get github.com/refraction-networking/utls
+        go get golang.org/x/net/http2/hpack
+        
+        # Очищаем кэш и собираем
         go mod tidy
         GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o reality-scanner main.go
 
