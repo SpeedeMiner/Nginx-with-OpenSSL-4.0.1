@@ -83,30 +83,76 @@ func getCountry(ip string) string {
 }
 
 func getASNAndPrefix(ip string) (string, string) {
+	var asn, prefix string
 	client := &http.Client{Timeout: 6 * time.Second}
+
+	// 1. Попытка получить данные через RIPE NCC
 	resp, err := client.Get(fmt.Sprintf("https://stat.ripe.net/data/network-info/data.json?resource=%s", ip))
-	if err != nil {
-		return "", ""
+	if err == nil {
+		var result struct {
+			Data struct {
+				ASNs   []interface{} `json:"asns"`
+				Prefix string        `json:"prefix"`
+			} `json:"data"`
+		}
+		json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
+
+		if len(result.Data.ASNs) > 0 {
+			asn = fmt.Sprintf("%v", result.Data.ASNs[0])
+			if !strings.HasPrefix(strings.ToUpper(asn), "AS") {
+				asn = "AS" + asn
+			}
+		}
+		prefix = result.Data.Prefix
 	}
-	defer resp.Body.Close()
-	var result struct {
-		Data struct {
-			ASNs   []interface{} `json:"asns"`
-			Prefix string        `json:"prefix"`
-		} `json:"data"`
+
+	// 2. Фолбэк: если RIPE недоступен или пуст, ищем ASN через ip-api
+	if asn == "" {
+		resp2, err2 := client.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=as", ip))
+		if err2 == nil {
+			var res2 struct {
+				AS string `json:"as"`
+			}
+			json.NewDecoder(resp2.Body).Decode(&res2)
+			resp2.Body.Close()
+
+			if res2.AS != "" {
+				// ip-api отдает строку вида "AS12345 Provider Name"
+				parts := strings.Split(res2.AS, " ")
+				if len(parts) > 0 {
+					asn = strings.ToUpper(parts[0])
+					if !strings.HasPrefix(asn, "AS") {
+						asn = "AS" + asn
+					}
+				}
+			}
+		}
 	}
-	json.NewDecoder(resp.Body).Decode(&result)
-	if len(result.Data.ASNs) == 0 {
-		return "", ""
+
+	if asn == "" {
+		asn = "UNKNOWN_ASN"
 	}
-	asn := fmt.Sprintf("%v", result.Data.ASNs[0])
-	if !strings.HasPrefix(strings.ToUpper(asn), "AS") {
-		asn = "AS" + asn
+
+	// 3. Фолбэк: если нет точного префикса, генерируем стандартный /24
+	if prefix == "" {
+		parsedIP := net.ParseIP(ip)
+		if parsedIP != nil {
+			parsedIP = parsedIP.To4()
+			if parsedIP != nil {
+				prefix = fmt.Sprintf("%d.%d.%d.0/24", parsedIP[0], parsedIP[1], parsedIP[2])
+			}
+		}
 	}
-	return asn, result.Data.Prefix
+
+	return asn, prefix
 }
 
 func getPrefixes(asn string) []string {
+	if asn == "UNKNOWN_ASN" {
+		return nil // Не делаем лишний запрос, если ASN неизвестен
+	}
+
 	client := &http.Client{Timeout: 6 * time.Second}
 	resp, err := client.Get(fmt.Sprintf("https://stat.ripe.net/data/announced-prefixes/data.json?resource=%s", asn))
 	if err != nil {
