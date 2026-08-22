@@ -65,30 +65,62 @@ func getCountry(ip string) string {
 }
 
 func getASNAndPrefix(ip string) (string, string) {
+	asn, prefix := "", ""
 	client := &http.Client{Timeout: 6 * time.Second}
+	
+	// 1. Пробуем через RIPE
 	resp, err := client.Get(fmt.Sprintf("https://stat.ripe.net/data/network-info/data.json?resource=%s", ip))
-	if err != nil {
-		return "", ""
+	if err == nil {
+		defer resp.Body.Close()
+		var result struct {
+			Data struct {
+				ASNs   []interface{} `json:"asns"`
+				Prefix string        `json:"prefix"`
+			} `json:"data"`
+		}
+		if json.NewDecoder(resp.Body).Decode(&result) == nil {
+			if len(result.Data.ASNs) > 0 {
+				asn = fmt.Sprintf("%v", result.Data.ASNs[0])
+				if !strings.HasPrefix(strings.ToUpper(asn), "AS") {
+					asn = "AS" + asn
+				}
+			}
+			prefix = result.Data.Prefix
+		}
 	}
-	defer resp.Body.Close()
-	var result struct {
-		Data struct {
-			ASNs   []interface{} `json:"asns"`
-			Prefix string        `json:"prefix"`
-		} `json:"data"`
+
+	// 2. Резервный поиск ASN через ip-api
+	if asn == "" {
+		resp2, err2 := client.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=as", ip))
+		if err2 == nil {
+			defer resp2.Body.Close()
+			var res2 struct {
+				AS string `json:"as"`
+			}
+			if json.NewDecoder(resp2.Body).Decode(&res2) == nil {
+				parts := strings.Split(res2.AS, " ")
+				if len(parts) > 0 && strings.HasPrefix(parts[0], "AS") {
+					asn = parts[0]
+				}
+			}
+		}
 	}
-	json.NewDecoder(resp.Body).Decode(&result)
-	if len(result.Data.ASNs) == 0 {
-		return "", ""
+
+	// 3. Резервный префикс (жестко берем /24 от IP), если RIPE ничего не вернул
+	if prefix == "" {
+		parsedIP := net.ParseIP(ip).To4()
+		if parsedIP != nil {
+			prefix = fmt.Sprintf("%d.%d.%d.0/24", parsedIP[0], parsedIP[1], parsedIP[2])
+		}
 	}
-	asn := fmt.Sprintf("%v", result.Data.ASNs[0])
-	if !strings.HasPrefix(strings.ToUpper(asn), "AS") {
-		asn = "AS" + asn
-	}
-	return asn, result.Data.Prefix
+
+	return asn, prefix
 }
 
 func getPrefixes(asn string) []string {
+	if asn == "" {
+		return nil
+	}
 	client := &http.Client{Timeout: 6 * time.Second}
 	resp, err := client.Get(fmt.Sprintf("https://stat.ripe.net/data/announced-prefixes/data.json?resource=%s", asn))
 	if err != nil {
@@ -284,7 +316,7 @@ func getPTR(ip string) []string {
 	return res
 }
 
-// ================= UTLS И ПРОБИНГ (БЕЗ HTTP/2) =================
+// ================= UTLS И ПРОБИНГ =================
 func checkTLS(ip, sni string) (string, []string) {
 	dialer := &net.Dialer{Timeout: ConnectTimeout}
 	conn, err := dialer.Dial("tcp", net.JoinHostPort(ip, "443"))
@@ -367,7 +399,7 @@ func probeIP(ip string) (string, []string) {
 		if d != ip {
 			finalDoms = append(finalDoms, d)
 		}
-		if len(finalDoms) >= 5 { // Ограничиваем список вывода
+		if len(finalDoms) >= 5 {
 			break
 		}
 	}
@@ -420,6 +452,7 @@ func main() {
 	}
 
 	allPrefixes := getPrefixes(asn)
+	// Важно: если API не выдало подсетей, используем сгенерированный фолбэк-префикс
 	if len(allPrefixes) == 0 && prefix != "" {
 		allPrefixes = []string{prefix}
 	}
@@ -463,7 +496,6 @@ func main() {
 			defer wg.Done()
 			for ip := range jobs {
 				_, doms := probeIP(ip)
-				// Если нашлись домены (уже отфильтрованные от самого IP внутри probeIP)
 				if len(doms) > 0 {
 					results <- Target{IP: ip, Domains: doms}
 				}
