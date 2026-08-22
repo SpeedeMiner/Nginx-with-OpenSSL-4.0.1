@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
@@ -11,7 +10,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -150,7 +148,6 @@ func generateIPs(prefixes []string, maxIPs int) []string {
 				}
 			}
 		} else {
-			// Упрощенная логика сэмплинга для огромных подсетей
 			count := 0
 			for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); inc(ip) {
 				ipStr := ip.String()
@@ -202,7 +199,6 @@ func getOSINTDomains(ip string) []string {
 	var domains []string
 	client := &http.Client{Timeout: 4 * time.Second}
 
-	// 1. AlienVault
 	req, _ := http.NewRequest("GET", fmt.Sprintf("https://otx.alienvault.com/api/v1/indicators/IPv4/%s/passive_dns", ip), nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	if resp, err := client.Do(req); err == nil {
@@ -247,13 +243,12 @@ func checkTLS(ip, sni string) (string, []string) {
 	uConn := utls.UClient(conn, &utls.Config{
 		ServerName:         sni,
 		InsecureSkipVerify: true,
-	}, utls.HelloChrome_Auto) // Маскируемся под Chrome!
+	}, utls.HelloChrome_Auto) // Маскируемся под Chrome
 
 	uConn.SetDeadline(time.Now().Add(ConnectTimeout))
 	err = uConn.Handshake()
 
 	if err != nil {
-		// Порт открыт, но рукопожатие сброшено (ssl_reject_handshake)
 		return "SSL_ERROR", nil
 	}
 
@@ -285,7 +280,7 @@ func probeIP(ip string) (string, []string) {
 	}
 
 	if len(domSet) > 15 {
-		return ip, nil // CDN / Shared
+		return ip, nil // Дроп CDN / Shared
 	}
 
 	if status == "SSL_ERROR" || len(domSet) == 0 {
@@ -307,7 +302,7 @@ func probeIP(ip string) (string, []string) {
 					for _, d := range cDoms {
 						domSet[d] = true
 					}
-					break // Нашли хотя бы один рабочий домен!
+					break
 				}
 			}
 		}
@@ -326,7 +321,7 @@ func probeIP(ip string) (string, []string) {
 // ================= HTTP/2 ВАЛИДАЦИЯ (ФАЗА 2) =================
 func buildH2Headers(sni string) []byte {
 	var payload []byte
-	payload = append(payload, 0x82, 0x87, 0x84) // GET, https, /
+	payload = append(payload, 0x82, 0x87, 0x84)
 	sniBytes := []byte(sni)
 	payload = append(payload, 0x01, byte(len(sniBytes)))
 	payload = append(payload, sniBytes...)
@@ -349,7 +344,6 @@ func buildH2Frame(frameType, flags byte, streamId uint32, payload []byte) []byte
 }
 
 func verifyH2(ip, sni string) *ValidResult {
-	// DNS ПРОВЕРКА
 	if val, ok := dnsCache.Load(sni); ok {
 		if !strings.Contains(val.(string), ip) {
 			return nil
@@ -400,12 +394,10 @@ func verifyH2(ip, sni string) *ValidResult {
 		alpn = "h2 (no ALPN)"
 	}
 
-	// Отправляем H2 Preface + HEADERS
 	uConn.Write([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"))
-	uConn.Write(buildH2Frame(0x04, 0, 0, []byte{})) // SETTINGS
+	uConn.Write(buildH2Frame(0x04, 0, 0, []byte{}))
 	uConn.Write(buildH2Frame(0x01, 0x05, 1, buildH2Headers(sni)))
 
-	// Читаем фреймы
 	buf := make([]byte, 8192)
 	recvBuf := bytes.Buffer{}
 	decoder := hpack.NewDecoder(4096, nil)
@@ -433,7 +425,7 @@ func verifyH2(ip, sni string) *ValidResult {
 			data := recvBuf.Bytes()
 			length := int(data[0])<<16 | int(data[1])<<8 | int(data[2])
 			if recvBuf.Len() < 9+length {
-				break // Ждем еще данных
+				break
 			}
 
 			frameType := data[3]
@@ -446,9 +438,9 @@ func verifyH2(ip, sni string) *ValidResult {
 				isH2 = true
 			}
 
-			if frameType == 0x04 && (flags&0x01) == 0 { // SETTINGS ACK
+			if frameType == 0x04 && (flags&0x01) == 0 {
 				uConn.Write(buildH2Frame(0x04, 0x01, 0, []byte{}))
-			} else if frameType == 0x01 && streamId == 1 { // HEADERS
+			} else if frameType == 0x01 && streamId == 1 {
 				headers, _ := decoder.DecodeFull(payload)
 				for _, h := range headers {
 					if h.Name == ":status" {
@@ -458,7 +450,7 @@ func verifyH2(ip, sni string) *ValidResult {
 						server = h.Value
 					}
 				}
-			} else if frameType == 0x00 && streamId == 1 { // DATA
+			} else if frameType == 0x00 && streamId == 1 {
 				dataBytes += len(payload)
 			}
 		}
@@ -475,7 +467,7 @@ func verifyH2(ip, sni string) *ValidResult {
 	serverLower := strings.ToLower(server)
 	for _, cdn := range bannedServers {
 		if strings.Contains(serverLower, cdn) {
-			return nil // Дропаем CDN
+			return nil
 		}
 	}
 
@@ -518,7 +510,7 @@ func main() {
 	}
 
 	myIP := getPublicIP()
-	asn, prefix := getOriginAndNetworkInfo(myIP)
+	asn, prefix := getASNAndPrefix(myIP)
 	fmt.Printf("[*] Внешний IP:        %s\n", myIP)
 	fmt.Printf("[*] Announcing ASN:    %s (Локальный префикс: %s)\n", asn, prefix)
 	fmt.Printf("[*] Параллелизм:       %d горутин\n", *workers)
@@ -533,7 +525,10 @@ func main() {
 	totalIPs := len(ips)
 	fmt.Printf("[*] Подготовлено %d IP адресов. Запуск...\n", totalIPs)
 
-	// ФАЗА 1: ПРОБИНГ
+	if totalIPs == 0 {
+		return
+	}
+
 	jobs := make(chan string, totalIPs)
 	results1 := make(chan Target, totalIPs)
 	var wg sync.WaitGroup
@@ -564,7 +559,6 @@ func main() {
 	}
 	fmt.Printf("\n[+] Этап 1 завершен. Найдено чистых IP с доменами: %d\n", len(targets))
 
-	// ФАЗА 2: ВАЛИДАЦИЯ
 	type ValidateJob struct {
 		IP  string
 		SNI string
@@ -593,7 +587,6 @@ func main() {
 	wg.Wait()
 	close(results2)
 
-	// СОРТИРОВКА И ВЫВОД
 	var finalResults []*ValidResult
 	for r := range results2 {
 		finalResults = append(finalResults, r)
