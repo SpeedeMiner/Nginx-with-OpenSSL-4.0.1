@@ -15,15 +15,14 @@ import threading
 import time
 import urllib.request
 
-# Уменьшаем размер стека для каждого нового потока (OSINT/PTR) до 512 КБ 
-# для экономии памяти на слабых VPS (1vCPU/1GB)
+# Ограничиваем стек потоков для экономии памяти на 1vCPU/1GB
 try:
     threading.stack_size(524288)
 except Exception:
     pass
 
 # ================= НАСТРОЙКИ СКОРОСТИ =================
-CONNECT_TIMEOUT = 0.5
+CONNECT_TIMEOUT = 1.2
 MAX_HOSTS_PER_24 = 254
 MAX_SAMPLED_24_PER_LARGE_PREFIX = 4
 
@@ -31,6 +30,9 @@ BANNED_TLDS = {
     "crl", "ocsp", "der", "crt", "cer", "pem", "arpa", 
     "local", "internal", "invalid", "example", "test", "localhost"
 }
+
+# Отбрасываем известные CDN, так как Reality за ними не работает (TLS interception)
+BANNED_SERVERS = ["cloudflare", "fastly", "akamai", "ddos-guard", "qrator", "sucuri"]
 
 # SSL Контексты
 CTX_RAW = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -219,35 +221,26 @@ def get_hardware_defaults():
                 if line.startswith('MemTotal:'):
                     mem_mb = int(line.split()[1]) // 1024
                     break
-    except Exception:
-        pass
-    
-    if mem_mb < 1200: # ~1GB VPS
-        return 50, max(4, cores * 2)
-    elif mem_mb < 2500: # ~2GB VPS
-        return 100, max(8, cores * 4)
-    else: # 4GB+ 
-        return 200, 16
+    except Exception: pass
+    if mem_mb < 1200: return 50, max(4, cores * 2)
+    elif mem_mb < 2500: return 120, max(8, cores * 4)
+    else: return 250, 16
 
 def fetch_ripestat_safe(endpoint, resource, params="", timeout=8):
     try:
-        url = f"https://stat.ripe.net/data/{endpoint}/data.json?resource={resource}{params}"
-        req = urllib.request.Request(url, headers={"User-Agent": "RIPE-Reality-Scanner/5.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode())
-            return data.get("data", {})
-    except Exception:
-        return {}
+        req = urllib.request.Request(f"https://stat.ripe.net/data/{endpoint}/data.json?resource={resource}{params}", headers={"User-Agent": "RIPE-Reality-Scanner/6.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode()).get("data", {})
+    except Exception: return {}
 
 def get_public_ip():
-    for service in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
+    for url in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
         try:
-            req = urllib.request.Request(service, headers={"User-Agent": "curl/7.88.1"})
-            with urllib.request.urlopen(req, timeout=4) as resp:
-                ip = resp.read().decode().strip()
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/7.88.1"})
+            with urllib.request.urlopen(req, timeout=4) as r:
+                ip = r.read().decode().strip()
                 if ipaddress.ip_address(ip).version == 4: return ip
-        except Exception:
-            continue
+        except Exception: continue
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.connect(("1.1.1.1", 80))
         return s.getsockname()[0]
@@ -272,8 +265,7 @@ def get_origin_and_network_info(ip):
     net_data = fetch_ripestat_safe("network-info", ip, timeout=6)
     asns = net_data.get("asns", [])
     if not asns: raise RuntimeError(f"Не удалось получить ASN для IP {ip}")
-    asn = f"AS{asns[0]}" if not str(asns[0]).upper().startswith("AS") else str(asns[0])
-    return asn, net_data.get("prefix")
+    return f"AS{asns[0]}" if not str(asns[0]).upper().startswith("AS") else str(asns[0]), net_data.get("prefix")
 
 def get_asn_prefixes(asn):
     ris_data = fetch_ripestat_safe("ris-prefixes", asn, "&types=o&af=v4", timeout=6)
@@ -328,16 +320,12 @@ def filter_prefixes_by_country(prefixes, target_country):
     return sorted(list(matched))
 
 def iter_scan_ips(prefixes, my_ip, max_ips=0):
-    """Генератор пула IP: решает проблему OOM (не строит списки в памяти) и использует islice"""
     seen = {my_ip}
     yielded = 0
     for p_str in prefixes:
         if max_ips > 0 and yielded >= max_ips: return
-        try:
-            net = ipaddress.ip_network(p_str, strict=False)
-        except Exception:
-            continue
-            
+        try: net = ipaddress.ip_network(p_str, strict=False)
+        except Exception: continue
         if net.prefixlen >= 24:
             count = 0  
             for ip in net.hosts():
@@ -350,7 +338,6 @@ def iter_scan_ips(prefixes, my_ip, max_ips=0):
                     if max_ips > 0 and yielded >= max_ips: return
                     if count >= MAX_HOSTS_PER_24: break
         else:
-            # Использование itertools.islice вместо [:] предотвращает аллокацию всех /24 подсетей (бомба для /8)
             for s in itertools.islice(net.subnets(new_prefix=24), MAX_SAMPLED_24_PER_LARGE_PREFIX):
                 if max_ips > 0 and yielded >= max_ips: return
                 count = 0
@@ -365,7 +352,7 @@ def iter_scan_ips(prefixes, my_ip, max_ips=0):
                         if count >= MAX_HOSTS_PER_24: break
 
 
-# ================= Strict Domain Validation & ASN.1 =================
+# ================= ПАРСИНГ X.509 =================
 
 def clean_domain(dom_str):
     if not dom_str or not isinstance(dom_str, str): return None
@@ -532,48 +519,52 @@ async def check_tls_async(ip_str, hostname):
         der = writer.get_extra_info('ssl_object').getpeercert(binary_form=True)
         writer.close()
         await writer.wait_closed()
-        return der
+        return "OK", der
+    except ssl.SSLError:
+        return "SSL_ERROR", None
+    except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
+        return "DEAD", None
     except Exception:
-        return None
+        return "DEAD", None
+
 
 async def probe_ip_target_async(ip_str, loop, executor):
     discovered_domains = set()
-    
-    ptr_doms = await loop.run_in_executor(executor, get_ptr_domains, ip_str)
-    discovered_domains.update(ptr_doms)
 
-    direct_der = await check_tls_async(ip_str, ip_str)
-    direct_success = False
-    if direct_der:
+    # Быстрый пинг (ZERO-COST для мертвых IP)
+    status, direct_der = await check_tls_async(ip_str, ip_str)
+
+    # ОПТИМИЗАЦИЯ 1: Мертвый IP пропускаем
+    if status == "DEAD":
+        return ip_str, set()
+
+    if status == "OK" and direct_der:
         discovered_domains.update(parse_x509_der(direct_der))
-        direct_success = True
 
-    if ptr_doms:
-        async def check_and_add(c):
-            c_der = await check_tls_async(ip_str, c)
-            if c_der: discovered_domains.update(parse_x509_der(c_der))
-        await asyncio.gather(*(check_and_add(c) for c in ptr_doms))
+    # ОПТИМИЗАЦИЯ 2: Если доменов слишком много (>15) - это Shared/CDN.
+    if len(discovered_domains) > 15:
+        return ip_str, set()
 
-    if not direct_success and not discovered_domains:
-        is_open = False
-        try:
-            reader, writer = await asyncio.wait_for(asyncio.open_connection(ip_str, 443), timeout=1.0)
-            writer.close()
-            await writer.wait_closed()
-            is_open = True
-        except Exception:
-            pass
-            
-        if is_open:
+    # ОПТИМИЗАЦИЯ 3: Делаем OSINT/PTR только если порт жив, но TLS не прошел (или пустой)
+    if status == "SSL_ERROR" or (status == "OK" and not discovered_domains):
+        ptr_doms = await loop.run_in_executor(executor, get_ptr_domains, ip_str)
+        if ptr_doms:
+            async def check_c(c):
+                c_stat, c_der = await check_tls_async(ip_str, c)
+                if c_stat == "OK" and c_der: discovered_domains.update(parse_x509_der(c_der))
+            await asyncio.gather(*(check_c(c) for c in ptr_doms))
+
+        if not discovered_domains:
             osint_doms = await loop.run_in_executor(executor, get_osint_domains, ip_str)
-            if osint_doms:
-                for candidate in osint_doms:
-                    c_der = await check_tls_async(ip_str, candidate)
-                    if c_der:
-                        discovered_domains.update(parse_x509_der(c_der))
-                        break
+            for candidate in osint_doms:
+                c_stat, c_der = await check_tls_async(ip_str, candidate)
+                if c_stat == "OK" and c_der:
+                    discovered_domains.update(parse_x509_der(c_der))
+                    break 
 
-    return ip_str, discovered_domains
+    # ОПТИМИЗАЦИЯ 4: Оставляем только ТОП-5 для H2 фазы
+    final_domains = list(discovered_domains)[:5]
+    return ip_str, set(final_domains)
 
 
 async def verify_target_h2_async(ip_str, sni, loop, executor):
@@ -658,6 +649,11 @@ async def verify_target_h2_async(ip_str, sni, loop, executor):
 
         if not is_h2_confirmed: return None
 
+        # ОПТИМИЗАЦИЯ: Отсев CDN по заголовку
+        server_hdr = headers_received.get("server", "").lower()
+        if any(cdn in server_hdr for cdn in BANNED_SERVERS):
+            return None
+
         return {
             "dest": f"{sni}:443",
             "sni": sni,
@@ -680,7 +676,6 @@ async def run_scan(target_prefixes, my_ip, args):
     concurrency = args.concurrency
 
     # ================= ЭТАП 1: ПРОБИНГ =================
-    # Ограниченная очередь для защиты от OOM
     queue1 = asyncio.Queue(maxsize=concurrency * 4)
     found_entries = set()
     done_count = 0
@@ -757,7 +752,7 @@ def main():
 
     auto_concurrency, auto_io_threads = get_hardware_defaults()
 
-    parser = argparse.ArgumentParser(description="Strict Reality Scanner (Async + OOM Safe + OSINT Bypass)")
+    parser = argparse.ArgumentParser(description="Strict Reality Scanner (Async + OSINT Bypass + CDN Drop)")
     parser.add_argument("-c", "--country", type=str, help="Принудительно код страны (например, RU, US, NL)")
     parser.add_argument("--all", action="store_true", help="Сканировать все подсети ASN без гео-фильтра")
     parser.add_argument("--debug-ip", type=str, help="Отладка конкретного IP (например, 94.156.181.211)")
@@ -767,7 +762,7 @@ def main():
     args = parser.parse_args()
 
     print("=" * 115)
-    print("      RIPE REALITY SCANNER (Async + Safe Memory + Smart Threads)")
+    print("      RIPE REALITY SCANNER (Async + Safe Memory + Smart Threads + CDN Drop)")
     print("=" * 115)
 
     my_ip = get_public_ip()
