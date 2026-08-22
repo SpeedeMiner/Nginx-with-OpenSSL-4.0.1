@@ -68,6 +68,20 @@ func getPublicIP() string {
 	return "127.0.0.1"
 }
 
+func getCountry(ip string) string {
+	client := &http.Client{Timeout: 4 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=countryCode", ip))
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	var result struct {
+		CountryCode string `json:"countryCode"`
+	}
+	json.NewDecoder(resp.Body).Decode(&result)
+	return strings.ToUpper(result.CountryCode)
+}
+
 func getASNAndPrefix(ip string) (string, string) {
 	client := &http.Client{Timeout: 6 * time.Second}
 	resp, err := client.Get(fmt.Sprintf("https://stat.ripe.net/data/network-info/data.json?resource=%s", ip))
@@ -114,6 +128,63 @@ func getPrefixes(asn string) []string {
 		}
 	}
 	return prefixes
+}
+
+func filterPrefixesByCountry(prefixes []string, targetCountry string) []string {
+	if targetCountry == "" || len(prefixes) == 0 {
+		return prefixes
+	}
+	targetCountry = strings.ToUpper(targetCountry)
+
+	type QueryItem struct {
+		Query string `json:"query"`
+	}
+
+	queryToPrefix := make(map[string]string)
+	var allQueries []QueryItem
+
+	for _, p := range prefixes {
+		ip, _, err := net.ParseCIDR(p)
+		if err == nil {
+			qIP := ip.String()
+			queryToPrefix[qIP] = p
+			allQueries = append(allQueries, QueryItem{Query: qIP})
+		}
+	}
+
+	var matched []string
+	batchSize := 100
+
+	for i := 0; i < len(allQueries); i += batchSize {
+		end := i + batchSize
+		if end > len(allQueries) {
+			end = len(allQueries)
+		}
+		batch := allQueries[i:end]
+
+		reqBody, _ := json.Marshal(batch)
+		resp, err := http.Post("http://ip-api.com/batch?fields=query,countryCode,status", "application/json", bytes.NewBuffer(reqBody))
+		if err != nil {
+			continue
+		}
+
+		var resData []struct {
+			Query       string `json:"query"`
+			CountryCode string `json:"countryCode"`
+			Status      string `json:"status"`
+		}
+		json.NewDecoder(resp.Body).Decode(&resData)
+		resp.Body.Close()
+
+		for _, item := range resData {
+			if item.Status == "success" && strings.ToUpper(item.CountryCode) == targetCountry {
+				if pref, ok := queryToPrefix[item.Query]; ok {
+					matched = append(matched, pref)
+				}
+			}
+		}
+	}
+	return matched
 }
 
 // ================= ГЕНЕРАТОР IP =================
@@ -243,7 +314,7 @@ func checkTLS(ip, sni string) (string, []string) {
 	uConn := utls.UClient(conn, &utls.Config{
 		ServerName:         sni,
 		InsecureSkipVerify: true,
-	}, utls.HelloChrome_Auto) // Маскируемся под Chrome
+	}, utls.HelloChrome_Auto) 
 
 	uConn.SetDeadline(time.Now().Add(ConnectTimeout))
 	err = uConn.Handshake()
@@ -325,7 +396,7 @@ func buildH2Headers(sni string) []byte {
 	sniBytes := []byte(sni)
 	payload = append(payload, 0x01, byte(len(sniBytes)))
 	payload = append(payload, sniBytes...)
-	ua := []byte("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36")
+	ua := []byte("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 	payload = append(payload, 0x0F, 0x2B, byte(len(ua)))
 	payload = append(payload, ua...)
 	return payload
@@ -488,7 +559,9 @@ func main() {
 	workers := flag.Int("w", 500, "Количество горутин (concurrency)")
 	maxIPs := flag.Int("max-ips", 0, "Лимит IP для скана")
 	debugIP := flag.String("debug-ip", "", "Проверить один IP")
-	vpsIP := flag.String("vps-ip", "", "IP вашего сервера для поиска сети (запуск с ПК)") // ДОБАВЛЕН ФЛАГ
+	vpsIP := flag.String("vps-ip", "", "IP сервера для поиска сети (запуск с ПК)")
+	countryFlag := flag.String("c", "", "Принудительно код страны (например, RU, US, NL)")
+	allFlag := flag.Bool("all", false, "Сканировать все подсети ASN без гео-фильтра")
 	flag.Parse()
 
 	fmt.Println(strings.Repeat("=", 115))
@@ -496,7 +569,6 @@ func main() {
 	fmt.Println(strings.Repeat("=", 115))
 
 	if *debugIP != "" {
-		// ... код дебага оставляем как был ...
 		fmt.Printf("\n[*] Отладка IP: %s\n", *debugIP)
 		ip, doms := probeIP(*debugIP)
 		fmt.Printf("[+] Домены (ASN.1 + OSINT): %v\n", doms)
@@ -511,7 +583,6 @@ func main() {
 		return
 	}
 
-	// ЛОГИКА ПОДМЕНЫ IP
 	var myIP string
 	if *vpsIP != "" {
 		myIP = *vpsIP
@@ -525,17 +596,49 @@ func main() {
 	fmt.Printf("[*] Announcing ASN:          %s (Локальный префикс: %s)\n", asn, prefix)
 	fmt.Printf("[*] Параллелизм:             %d горутин\n", *workers)
 
+	var country string
+	if *allFlag {
+		fmt.Println("[*] Фильтрация по гео:       Отключена (флаг --all)")
+	} else if *countryFlag != "" {
+		country = strings.ToUpper(*countryFlag)
+		fmt.Printf("[*] Страна сервера:          %s (задана вручную)\n", country)
+	} else {
+		country = getCountry(myIP)
+		fmt.Printf("[*] Страна сервера:          %s (GeoIP)\n", country)
+	}
+
 	allPrefixes := getPrefixes(asn)
 	if len(allPrefixes) == 0 && prefix != "" {
 		allPrefixes = []string{prefix}
 	}
-	fmt.Printf("[*] Подсетей (BGP):    %d\n", len(allPrefixes))
 
-	ips := generateIPs(allPrefixes, *maxIPs)
+	var targetPrefixes []string
+	if *allFlag || country == "" {
+		targetPrefixes = allPrefixes
+	} else {
+		targetPrefixes = filterPrefixesByCountry(allPrefixes, country)
+		
+		// Обязательно добавляем префикс самого сервера, если он не попал в фильтр
+		foundLocal := false
+		for _, p := range targetPrefixes {
+			if p == prefix {
+				foundLocal = true
+				break
+			}
+		}
+		if !foundLocal && prefix != "" {
+			targetPrefixes = append([]string{prefix}, targetPrefixes...)
+		}
+	}
+
+	fmt.Printf("[*] Подсетей для скана:      %d (из %d)\n", len(targetPrefixes), len(allPrefixes))
+
+	ips := generateIPs(targetPrefixes, *maxIPs)
 	totalIPs := len(ips)
 	fmt.Printf("[*] Подготовлено %d IP адресов. Запуск...\n", totalIPs)
 
 	if totalIPs == 0 {
+		fmt.Println("[-] Нет IP-адресов для сканирования.")
 		return
 	}
 
