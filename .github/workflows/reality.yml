@@ -16,21 +16,23 @@ jobs:
       with:
         go-version: '1.22'
 
-    - name: Build binary
+    - name: Build binaries
       run: |
-        # Инициализируем модуль
         go mod init reality-scanner
-        
-        # Скачиваем зависимости (utls и hpack)
         go get github.com/refraction-networking/utls
         go get golang.org/x/net/http2/hpack
-        
-        # Очищаем кэш и собираем
         go mod tidy
-        GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o reality-scanner main.go
+        
+        # 1. Сборка для Linux
+        GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o reality-scanner-linux main.go
+        
+        # 2. Сборка для Windows
+        GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o reality-scanner-windows.exe main.go
 
-    - name: Upload artifact
+    - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: reality-scanner-linux
-        path: reality-scanner
+        name: reality-scanner-binaries
+        path: |
+          reality-scanner-linux
+          reality-scanner-windows.exe
