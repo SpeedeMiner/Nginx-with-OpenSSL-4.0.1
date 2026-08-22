@@ -7,12 +7,11 @@ import re
 import socket
 import ssl
 import sys
-import threading
 import time
 import urllib.request
 
 CONNECT_TIMEOUT = 2.5
-MAX_WORKERS = 40
+MAX_WORKERS = 100  # Увеличено для максимальной утилизации Network I/O
 MAX_HOSTS_PER_24 = 254
 MAX_SAMPLED_24_PER_LARGE_PREFIX = 4
 
@@ -21,7 +20,7 @@ BANNED_TLDS = {
     "local", "internal", "invalid", "example", "test", "localhost"
 }
 
-# SSL Контексты
+# SSL Контексты (Создаются один раз)
 CTX_RAW = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 CTX_RAW.check_hostname = False
 CTX_RAW.verify_mode = ssl.CERT_NONE
@@ -34,7 +33,6 @@ CTX_REALITY.minimum_version = ssl.TLSVersion.TLSv1_3
 CTX_REALITY.maximum_version = ssl.TLSVersion.TLSv1_3
 
 DNS_CACHE = {}
-DNS_LOCK = threading.Lock()
 
 # ================= HPACK / H2 ENGINE (RFC 7540 / RFC 7541) =================
 
@@ -113,12 +111,7 @@ def decode_huffman(raw_bytes):
     for byte in raw_bytes:
         for b in range(7, -1, -1):
             bit = (byte >> b) & 1
-            if not isinstance(node, dict):
-                node = HUFFMAN_TREE
-            node = node.get(bit)
-            if node is None:
-                node = HUFFMAN_TREE
-                continue
+            node = node.get(bit, HUFFMAN_TREE)
             if "sym" in node:
                 sym = node["sym"]
                 if sym == 256:
@@ -165,13 +158,9 @@ def parse_hpack_headers(payload, flags=0):
     headers = {}
     try:
         offset = 0
-        pad_len = 0
-        if flags & 0x08:
-            if offset < len(payload):
-                pad_len = payload[offset]
-                offset += 1
-        if flags & 0x20:
-            offset += 5
+        pad_len = payload[offset] if (flags & 0x08) and offset < len(payload) else 0
+        offset += 1 if (flags & 0x08) else 0
+        offset += 5 if (flags & 0x20) else 0
 
         end_offset = len(payload) - pad_len if len(payload) >= pad_len else len(payload)
 
@@ -295,6 +284,7 @@ def get_asn_prefixes(asn):
 def filter_prefixes_by_country(prefixes, target_country):
     if not target_country or not prefixes:
         return prefixes
+    
     sample_map = {}
     batch_payload = []
     for p in prefixes:
@@ -306,10 +296,12 @@ def filter_prefixes_by_country(prefixes, target_country):
         except Exception:
             continue
 
-    matched = []
+    matched = set()
     batch_size = 100
-    for i in range(0, len(batch_payload), batch_size):
-        chunk = batch_payload[i : i + batch_size]
+    target_country = target_country.upper()
+    chunks = [batch_payload[i : i + batch_size] for i in range(0, len(batch_payload), batch_size)]
+
+    def process_chunk(chunk):
         try:
             req = urllib.request.Request(
                 "http://ip-api.com/batch?fields=query,countryCode,status",
@@ -319,17 +311,24 @@ def filter_prefixes_by_country(prefixes, target_country):
             with urllib.request.urlopen(req, timeout=6) as resp:
                 res = json.loads(resp.read().decode())
                 for item in res:
-                    if item.get("status") == "success" and item.get("countryCode", "").upper() == target_country.upper():
+                    if item.get("status") == "success" and item.get("countryCode", "").upper() == target_country:
                         ip_q = item.get("query")
                         if ip_q in sample_map:
-                            matched.append(sample_map[ip_q])
+                            matched.add(sample_map[ip_q])
+                return
         except Exception:
-            for item in chunk:
-                ip_q = item.get("query")
-                if ip_q in sample_map:
-                    matched.append(sample_map[ip_q])
+            pass
+        # Fallback при ошибке API - добавляем префиксы из чанка
+        for item in chunk:
+            ip_q = item.get("query")
+            if ip_q in sample_map:
+                matched.add(sample_map[ip_q])
 
-    return sorted(list(set(matched)))
+    # Параллельный запрос батчей для ускорения
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(20, len(chunks) or 1)) as ex:
+        ex.map(process_chunk, chunks)
+
+    return sorted(list(matched))
 
 
 # ================= Strict Domain Validation & ASN.1 =================
@@ -344,7 +343,6 @@ def clean_domain(dom_str):
     parts = dom_str.split(".")
     tld = parts[-1]
     
-    # Строгая проверка TLD: только буквы от 2 до 24 символов, не из черного списка
     if not re.match(r"^[a-z]{2,24}$", tld) or tld in BANNED_TLDS:
         return None
     
@@ -396,9 +394,11 @@ def parse_x509_der(der_bytes):
         tbs_elements.append(tlv)
         offset = tlv[2]
 
-    # 1. Subject Common Name (CN, OID 2.5.4.3)
     oid_cn = b"\x55\x04\x03"
+    oid_san = b"\x55\x1d\x11"
+    
     for tag, val, _ in tbs_elements:
+        # 1. Subject Common Name (CN, OID 2.5.4.3)
         if tag == 0x30 and oid_cn in val:
             sub_off = 0
             while sub_off < len(val):
@@ -418,17 +418,14 @@ def parse_x509_der(der_bytes):
                                 if cn_val_tlv:
                                     try:
                                         d = clean_domain(cn_val_tlv[1].decode("utf-8", errors="ignore"))
-                                        if d:
-                                            domains.add(d)
+                                        if d: domains.add(d)
                                     except Exception:
                                         pass
                         atv_off = atv[2]
                 sub_off = rdn[2]
 
-    # 2. SubjectAltName (SAN, OID 2.5.29.17) -> tag 0x82 (dNSName ONLY)
-    oid_san = b"\x55\x1d\x11"
-    for tag, val, _ in tbs_elements:
-        if (tag & 0xC0) == 0x80 and (tag & 0x1F) == 3:
+        # 2. SubjectAltName (SAN, OID 2.5.29.17) -> tag 0x82 (dNSName ONLY)
+        elif (tag & 0xC0) == 0x80 and (tag & 0x1F) == 3:
             ext_seq = decode_tlv(val, 0)
             if ext_seq and ext_seq[0] == 0x30:
                 e_off = 0
@@ -453,8 +450,7 @@ def parse_x509_der(der_bytes):
                                         if gn[0] == 0x82:  # Строго dNSName
                                             try:
                                                 d = clean_domain(gn[1].decode("ascii", errors="ignore"))
-                                                if d:
-                                                    domains.add(d)
+                                                if d: domains.add(d)
                                             except Exception:
                                                 pass
                                         gn_off = gn[2]
@@ -485,38 +481,31 @@ def probe_ip_target(ip_str):
     ptr_doms = get_ptr_domains(ip_str)
     discovered_domains.update(ptr_doms)
 
-    # 2. Прямой TLS опрос (без SNI)
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(CONNECT_TIMEOUT)
-        sock.connect((ip_str, 443))
-        with CTX_RAW.wrap_socket(sock, server_hostname=ip_str) as ssock:
-            der = ssock.getpeercert(binary_form=True)
-            if der:
-                discovered_domains.update(parse_x509_der(der))
-    except Exception:
-        pass
-
-    # 3. Дополнительный опрос с найденными через PTR SNI
-    for candidate in list(ptr_doms):
+    def check_tls(hostname):
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1.5)
-            sock.connect((ip_str, 443))
-            with CTX_RAW.wrap_socket(sock, server_hostname=candidate) as ssock:
-                der = ssock.getpeercert(binary_form=True)
-                if der:
-                    discovered_domains.update(parse_x509_der(der))
+            with socket.create_connection((ip_str, 443), timeout=CONNECT_TIMEOUT) as sock:
+                with CTX_RAW.wrap_socket(sock, server_hostname=hostname) as ssock:
+                    der = ssock.getpeercert(binary_form=True)
+                    if der:
+                        discovered_domains.update(parse_x509_der(der))
         except Exception:
             pass
+
+    # 2. Прямой TLS опрос (без SNI)
+    check_tls(ip_str)
+
+    # 3. Дополнительный опрос с найденными через PTR SNI
+    for candidate in ptr_doms:
+        check_tls(candidate)
 
     return ip_str, discovered_domains
 
 
 def resolve_domain_safe(domain):
-    with DNS_LOCK:
-        if domain in DNS_CACHE:
-            return DNS_CACHE[domain]
+    # Без DNS_LOCK, словари в Python потокобезопасны. Гонки просто обновят кэш.
+    cached = DNS_CACHE.get(domain)
+    if cached is not None:
+        return cached
 
     ips = []
     for _ in range(2):
@@ -526,8 +515,7 @@ def resolve_domain_safe(domain):
         except Exception:
             time.sleep(0.04)
 
-    with DNS_LOCK:
-        DNS_CACHE[domain] = ips
+    DNS_CACHE[domain] = ips
     return ips
 
 
@@ -536,7 +524,7 @@ def verify_target_h2(ip_str, sni):
     if not sni:
         return None
 
-    # 1. СТРОГАЯ DNS ПРОВЕРКА: IP домена обязан совпадать с IP сканирования
+    # 1. СТРОГАЯ DNS ПРОВЕРКА
     resolved_ips = resolve_domain_safe(sni)
     if not resolved_ips or (ip_str not in resolved_ips):
         return None
@@ -544,87 +532,86 @@ def verify_target_h2(ip_str, sni):
     # 2. Рукопожатие TLS 1.3 + Native HTTP/2
     try:
         t0 = time.perf_counter()
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(CONNECT_TIMEOUT)
-        sock.connect((ip_str, 443))
+        with socket.create_connection((ip_str, 443), timeout=CONNECT_TIMEOUT) as sock:
+            with CTX_REALITY.wrap_socket(sock, server_hostname=sni) as ssock:
+                rtt_ms = (time.perf_counter() - t0) * 1000
+                negotiated_alpn = ssock.selected_alpn_protocol()
+                alpn_tag = negotiated_alpn if negotiated_alpn else "h2 (no ALPN)"
 
-        with CTX_REALITY.wrap_socket(sock, server_hostname=sni) as ssock:
-            rtt_ms = (time.perf_counter() - t0) * 1000
-            negotiated_alpn = ssock.selected_alpn_protocol()
-            alpn_tag = negotiated_alpn if negotiated_alpn else "h2 (no ALPN)"
+                # Отправляем Client Preface + SETTINGS + HEADERS
+                ssock.sendall(H2_PREFACE)
+                ssock.sendall(build_h2_frame(0x04, 0, 0, b""))  # SETTINGS
+                req_headers = build_h2_request_headers(sni)
+                ssock.sendall(build_h2_frame(0x01, 0x05, 1, req_headers))  # HEADERS (END_STREAM | END_HEADERS)
 
-            # Отправляем Client Preface + SETTINGS + HEADERS
-            ssock.sendall(H2_PREFACE)
-            ssock.sendall(build_h2_frame(0x04, 0, 0, b""))  # SETTINGS
-            req_headers = build_h2_request_headers(sni)
-            ssock.sendall(build_h2_frame(0x01, 0x05, 1, req_headers))  # HEADERS (END_STREAM | END_HEADERS)
+                recv_buf = bytearray()
+                headers_received = {}
+                data_bytes_received = 0
+                is_h2_confirmed = False
+                end_stream_received = False
+                start_recv = time.perf_counter()
 
-            recv_buf = bytearray()
-            headers_received = {}
-            data_bytes_received = 0
-            is_h2_confirmed = False
-            start_recv = time.perf_counter()
+                while time.perf_counter() - start_recv < 2.5:
+                    try:
+                        chunk = ssock.recv(8192)
+                    except (socket.timeout, BlockingIOError):
+                        break
+                    
+                    if not chunk:
+                        break
+                    
+                    recv_buf.extend(chunk)
 
-            while time.perf_counter() - start_recv < 2.5:
-                try:
-                    chunk = ssock.recv(4096)
-                except socket.timeout:
-                    break
-                if not chunk:
-                    break
-                recv_buf.extend(chunk)
+                    if recv_buf.startswith(b"HTTP/1."):
+                        return None
 
-                if recv_buf.startswith(b"HTTP/1."):
+                    while len(recv_buf) >= 9:
+                        length = int.from_bytes(recv_buf[0:3], "big")
+                        frame_type = recv_buf[3]
+                        flags = recv_buf[4]
+                        stream_id = int.from_bytes(recv_buf[5:9], "big") & 0x7FFFFFFF
+
+                        if frame_type in (0x00, 0x01, 0x04, 0x07, 0x08):
+                            is_h2_confirmed = True
+
+                        if len(recv_buf) < 9 + length:
+                            break
+
+                        payload = recv_buf[9 : 9 + length]
+                        del recv_buf[: 9 + length]
+
+                        if frame_type == 0x04 and not (flags & 0x01):  # SETTINGS -> отвечаем ACK
+                            ssock.sendall(build_h2_frame(0x04, 0x01, 0, b""))
+
+                        elif frame_type == 0x01 and stream_id == 1:  # HEADERS
+                            if flags & 0x01: end_stream_received = True
+                            parsed = parse_hpack_headers(payload, flags)
+                            if parsed:
+                                headers_received.update(parsed)
+
+                        elif frame_type == 0x00 and stream_id == 1:  # DATA
+                            if flags & 0x01: end_stream_received = True
+                            data_bytes_received += len(payload)
+
+                    # Ранний выход: если получен статус, и либо данные, либо закрыт поток
+                    if is_h2_confirmed and ":status" in headers_received:
+                        if end_stream_received or data_bytes_received > 0 or (time.perf_counter() - start_recv > 0.4):
+                            break
+
+                if not is_h2_confirmed:
                     return None
 
-                while len(recv_buf) >= 9:
-                    length = int.from_bytes(recv_buf[0:3], "big")
-                    frame_type = recv_buf[3]
-                    flags = recv_buf[4]
-                    stream_id = int.from_bytes(recv_buf[5:9], "big") & 0x7FFFFFFF
-
-                    if frame_type in (0x00, 0x01, 0x04, 0x07, 0x08):
-                        is_h2_confirmed = True
-
-                    if len(recv_buf) < 9 + length:
-                        break
-
-                    payload = recv_buf[9 : 9 + length]
-                    del recv_buf[: 9 + length]
-
-                    if frame_type == 0x04 and not (flags & 0x01):  # SETTINGS -> отвечаем ACK
-                        ssock.sendall(build_h2_frame(0x04, 0x01, 0, b""))
-
-                    elif frame_type == 0x01 and stream_id == 1:  # HEADERS
-                        parsed = parse_hpack_headers(payload, flags)
-                        if parsed:
-                            headers_received.update(parsed)
-
-                    elif frame_type == 0x00 and stream_id == 1:  # DATA
-                        data_bytes_received += len(payload)
-
-                # Завершаем, если получен статус и данные (или поток закрыт)
-                if is_h2_confirmed and ":status" in headers_received:
-                    if data_bytes_received > 0 or (time.perf_counter() - start_recv > 0.4):
-                        break
-
-            if not is_h2_confirmed:
-                return None
-
-            http_status = headers_received.get(":status", "200")
-            server_hdr = headers_received.get("server", "-")
-
-            return {
-                "dest": f"{sni}:443",
-                "sni": sni,
-                "ip": ip_str,
-                "rtt": round(rtt_ms, 1),
-                "tls": "1.3",
-                "alpn": alpn_tag,
-                "status": http_status,
-                "server": server_hdr,
-                "data_bytes": data_bytes_received
-            }
+                return {
+                    "dest": f"{sni}:443",
+                    "sni": sni,
+                    "ip": ip_str,
+                    "rtt": round(rtt_ms, 1),
+                    "tls": "1.3",
+                    "alpn": alpn_tag,
+                    "status": headers_received.get(":status", "200"),
+                    "server": headers_received.get("server", "-"),
+                    "data_bytes": data_bytes_received
+                }
 
     except Exception:
         pass
@@ -632,19 +619,28 @@ def verify_target_h2(ip_str, sni):
 
 
 def generate_scan_ips(prefixes, my_ip):
+    # Оптимизировано с использованием set для гарантии O(1) проверки
     ip_scan_pool = []
+    seen = set([my_ip])
     for p_str in prefixes:
         net = ipaddress.ip_network(p_str, strict=False)
         if net.prefixlen >= 24:
-            hosts = [str(ip) for ip in net.hosts() if str(ip) != my_ip]
-            ip_scan_pool.extend(hosts[:MAX_HOSTS_PER_24])
+            for ip in net.hosts():
+                ip_s = str(ip)
+                if ip_s not in seen:
+                    seen.add(ip_s)
+                    ip_scan_pool.append(ip_s)
+                    if len(ip_scan_pool) % MAX_HOSTS_PER_24 == 0: break # Ускоренный break
         else:
             subnets_24 = list(net.subnets(new_prefix=24))
             sampled_subnets = subnets_24[:MAX_SAMPLED_24_PER_LARGE_PREFIX]
             for s in sampled_subnets:
-                hosts = [str(ip) for ip in s.hosts() if str(ip) != my_ip]
-                ip_scan_pool.extend(hosts)
-    return list(dict.fromkeys(ip_scan_pool))
+                for ip in s.hosts():
+                    ip_s = str(ip)
+                    if ip_s not in seen:
+                        seen.add(ip_s)
+                        ip_scan_pool.append(ip_s)
+    return ip_scan_pool
 
 
 def main():
@@ -670,11 +666,9 @@ def main():
             print(f"    - Проверка SNI '{d}': {res if res else 'ОТКЛОНЕН'}")
         sys.exit(0)
 
-    # 1. ASN и Префикс
     asn, announced_prefix = get_origin_and_network_info(my_ip)
     print(f"[*] Announcing ASN:    {asn} (Локальный префикс: {announced_prefix})")
 
-    # 2. Локация хоста
     if args.all:
         country = None
         print("[*] Фильтрация по гео: Отключена (флаг --all)")
@@ -685,11 +679,9 @@ def main():
         country = get_server_country(my_ip)
         print(f"[*] Страна сервера:    {country or 'Unknown'} (GeoIP)")
 
-    # 3. Префиксы
     all_prefixes = get_asn_prefixes(asn)
     print(f"[*] Всего префиксов:   {len(all_prefixes)} в базе BGP")
 
-    # 4. Фильтрация
     if args.all or not country:
         target_prefixes = all_prefixes
     else:
@@ -699,13 +691,12 @@ def main():
 
     print(f"[+] Подсетей для сканирования: {len(target_prefixes)}")
 
-    # 5. Пул IP
     ip_scan_pool = generate_scan_ips(target_prefixes, my_ip)
     total_ips = len(ip_scan_pool)
     print(f"[*] Подготовлено {total_ips} IP для сканирования...")
 
-    # 6. Сканирование сертификатов и PTR
-    found_entries = []
+    # Используем множества для автоматической дедупликации
+    found_entries = set()
     done_count = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(probe_ip_target, ip): ip for ip in ip_scan_pool}
@@ -715,13 +706,11 @@ def main():
                 print(f"\r[*] Этап 1/2: Сбор доменов (ASN.1 + PTR): {done_count}/{total_ips} ({(done_count/total_ips)*100:.1f}%)", end="", flush=True)
             ip_str, domains = f.result()
             for dom in domains:
-                found_entries.append((ip_str, dom))
+                found_entries.add((ip_str, dom))
 
-    found_entries = list(set(found_entries))
     print(f"\n[+] Извлечено {len(found_entries)} чистых пар [IP <-> SNI].")
     print("[*] Этап 2/2: Строгая валидация TLS 1.3 + HTTP/2 (HEADERS, DATA, Status)...")
 
-    # 7. Валидация HTTP/2
     valid_targets = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(verify_target_h2, ip, dom) for ip, dom in found_entries]
