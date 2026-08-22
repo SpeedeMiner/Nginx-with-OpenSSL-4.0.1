@@ -325,7 +325,7 @@ func buildH2Headers(sni string) []byte {
 	sniBytes := []byte(sni)
 	payload = append(payload, 0x01, byte(len(sniBytes)))
 	payload = append(payload, sniBytes...)
-	ua := []byte("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	ua := []byte("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36")
 	payload = append(payload, 0x0F, 0x2B, byte(len(ua)))
 	payload = append(payload, ua...)
 	return payload
