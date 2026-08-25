@@ -20,6 +20,7 @@ import (
 	"os/signal"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,6 +35,7 @@ import (
 	"golang.org/x/net/http2/hpack"
 	"golang.org/x/net/publicsuffix"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/singleflight"
 )
 
 // ================= CONFIG & CONSTANTS =================
@@ -239,9 +241,14 @@ type PipelineStats struct {
 	DNSFailed             int
 	DNSNXDomain           int
 	DNSTimeout            int
+	DNSTemporary          int
+	DNSNoIPv4             int
 	DNSOtherErr           int
 	DNSResolvedIPs        int
+	DNSUniqueResolvedIPs  int
+	DNSUniqueTargetIPs    int
 	DNSTargetRangeMatches int
+	DNSTargetDomains      int
 	DNSValidPairs         int
 	TCPConnected          int
 	TLSHandshake          int
@@ -261,11 +268,13 @@ func NewPipelineStats() *PipelineStats {
 
 type RuntimeCaches struct {
 	DNSCache *SafeDNSCache
+	DNSGroup *singleflight.Group
 }
 
 func NewRuntimeCaches() *RuntimeCaches {
 	return &RuntimeCaches{
 		DNSCache: NewSafeDNSCache(),
+		DNSGroup: &singleflight.Group{},
 	}
 }
 
@@ -752,6 +761,18 @@ func classifyDomainQuality(sni string) string {
 	return "Normal"
 }
 
+func reverseIPv4(ip string) (string, error) {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return "", fmt.Errorf("invalid IP")
+	}
+	parsed = parsed.To4()
+	if parsed == nil {
+		return "", fmt.Errorf("not IPv4")
+	}
+	return fmt.Sprintf("%d.%d.%d.%d.in-addr.arpa.", parsed[3], parsed[2], parsed[1], parsed[0]), nil
+}
+
 // ================= ACTIVE RECON (TLS + PTR) =================
 
 func extractDomainsFromTLS(ctx context.Context, ip, sni string, timeout time.Duration) []string {
@@ -860,6 +881,35 @@ func resolveIPv4DNSCrypt(ctx context.Context, pool *DNSPool, domain string) ([]s
 		}
 	}
 	return ips, nil
+}
+
+func resolveIPv4Cached(ctx context.Context, pool *DNSPool, domain string, rtCaches *RuntimeCaches) ([]string, error) {
+	domain = CleanDomain(domain)
+	if domain == "" {
+		return nil, fmt.Errorf("invalid domain")
+	}
+	v, err, _ := rtCaches.DNSGroup.Do(domain, func() (interface{}, error) {
+		if cached, ok := rtCaches.DNSCache.Get(domain); ok {
+			if cached.NXDomain {
+				return nil, ErrDNSNXDomain
+			}
+			return cached.IPs, nil
+		}
+		ips, err := resolveIPv4DNSCrypt(ctx, pool, domain)
+		if errors.Is(err, ErrDNSNXDomain) {
+			rtCaches.DNSCache.Put(domain, &DNSCacheEntry{NXDomain: true}, 1*time.Minute)
+			return nil, err
+		}
+		if err != nil {
+			return nil, err
+		}
+		rtCaches.DNSCache.Put(domain, &DNSCacheEntry{IPs: ips}, 5*time.Minute)
+		return ips, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.([]string), nil
 }
 
 // ================= DB & IP HELPERS =================
@@ -1809,6 +1859,8 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	pipeStats.mu.Lock()
 	pipeStats.IPSampled = len(sampledIPs)
 	pipeStats.mu.Unlock()
+	
+	rtCaches := NewRuntimeCaches()
 
 	discoveredDomains := make(map[string]DomainSource)
 	var discoveredMu sync.Mutex
