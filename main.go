@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -75,9 +76,6 @@ var (
 	numRe    = regexp.MustCompile(`(?i)(^|\.)\d+\.[a-z]{2,}$`)
 
 	ErrDNSNXDomain = errors.New("NXDOMAIN")
-
-	uaRng *rand.Rand
-	uaMu  sync.Mutex
 )
 
 type Config struct {
@@ -89,7 +87,6 @@ type Config struct {
 	TLSTimeoutMs     int
 	H2ReadTimeoutMs  int
 	H2WriteTimeoutMs int
-	Seed             int64
 	TargetASN        string
 	TargetCountry    string
 	TargetIP         string
@@ -229,13 +226,9 @@ type PipelineStats struct {
 	DNSNXDomain           int
 	DNSTimeout            int
 	DNSTemporary          int
-	DNSNoIPv4             int
 	DNSOtherErr           int
 	DNSResolvedIPs        int
-	DNSUniqueResolvedIPs  int
-	DNSUniqueTargetIPs    int
 	DNSTargetRangeMatches int
-	DNSTargetDomains      int
 	DNSValidPairs         int
 
 	// PTR
@@ -679,11 +672,15 @@ func extractDomainsFromTLS(ctx context.Context, ip, sni string, timeout time.Dur
 func activeProbeIP(ctx context.Context, ip string, timeout time.Duration, noPTR bool, noTLS bool, pipeStats *PipelineStats) []TargetPair {
 	var pairs []TargetPair
 	sourceMap := make(map[string]DomainSource)
+	var allDoms []string
 
 	addDomain := func(d string, src DomainSource) {
 		d = CleanDomain(d)
 		if d == "" {
 			return
+		}
+		if _, exists := sourceMap[d]; !exists {
+			allDoms = append(allDoms, d)
 		}
 		sourceMap[d] |= src
 	}
@@ -703,7 +700,7 @@ func activeProbeIP(ctx context.Context, ip string, timeout time.Duration, noPTR 
 				addDomain(d, SourceDirectTLS)
 			}
 			
-			// Ранний выход как в старой версии, если нашли прямые домены (не грузим сеть лишними запросами)
+			// Ранний выход как в старой версии
 			if len(doms) <= 15 {
 				for d, src := range sourceMap {
 					pairs = append(pairs, TargetPair{IP: ip, SNI: d, Evidence: src})
@@ -1708,7 +1705,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 							pairsMu.Lock()
 							if len(validPairs) < LimitValidPairs {
 								validPairs = append(validPairs, TargetPair{
-									IP:       resolvedIP, // Обновляем IP на свежий из DNS
+									IP:       resolvedIP, 
 									SNI:      p.SNI,
 									Evidence: p.Evidence,
 								})
@@ -1929,6 +1926,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		ipClusters[c.IP] = append(ipClusters[c.IP], c)
 	}
 
+	// ИСПРАВЛЕНИЕ: Мы выводим ВСЕ результаты.
 	sort.Slice(candidates, func(i, j int) bool {
 		if candidates[i].Score != candidates[j].Score {
 			return candidates[i].Score > candidates[j].Score
@@ -1988,6 +1986,7 @@ func main() {
 	flag.IntVar(&cfg.TLSTimeoutMs, "tls-timeout", 3000, "TLS timeout ms")
 	flag.IntVar(&cfg.H2ReadTimeoutMs, "h2-read", 3000, "H2 Read timeout ms")
 	flag.IntVar(&cfg.H2WriteTimeoutMs, "h2-write", 2000, "H2 Write timeout ms")
+	flag.Int64Var(&cfg.Seed, "seed", time.Now().UnixNano(), "Random seed")
 	flag.StringVar(&cfg.TargetCountry, "c", "", "Hard Filter: Target Country Code")
 	flag.StringVar(&cfg.TargetASN, "asn", "", "Hard Filter: Target ASN constraint (e.g., AS12345)")
 	flag.StringVar(&cfg.TargetIP, "vps-ip", "", "IP сервера для поиска сети (запуск с ПК)")
@@ -1998,6 +1997,12 @@ func main() {
 	flag.BoolVar(&cfg.NoActiveTLS, "no-tls-probe", false, "Disable direct IP TLS certificate extraction")
 
 	flag.Parse()
+
+	if cfg.Seed != 0 {
+		uaMu.Lock()
+		uaRng = rand.New(rand.NewSource(cfg.Seed))
+		uaMu.Unlock()
+	}
 
 	if cfg.Workers < 1 {
 		cfg.Workers = 1
@@ -2089,6 +2094,7 @@ func main() {
 		}
 
 		sampledIPs := generateIPs(targetPrefixes, cfg.MaxIPs)
+
 		dnsRanges := MergeCIDRs(allPrefixes)
 
 		fmt.Printf("[*] Целевой IP:             %s\n", vpsQueryIP)
@@ -2112,7 +2118,7 @@ func main() {
 		return
 	}
 
-	fmt.Printf("\n[+] Найдено валидных HTTP/2 целей: %d\n\n", len(results))
+	fmt.Printf("\n[+] Найдено валидных HTTP/2 целей (после кластеризации): %d\n\n", len(results))
 	fmt.Printf("%-36s | %-15s | %-5s | %-4s | %-4s | %-4s | %-4s | %-4s | %-5s | %-6s | %4s %4s %4s\n",
 		"Цель (SNI)", "IP адрес", "SCORE", "TLS", "CERT", "H2", "SRV", "HTTP", "DSCOV", "STATUS", "TCP", "TLS", "H2")
 	fmt.Println(strings.Repeat("-", 126))
