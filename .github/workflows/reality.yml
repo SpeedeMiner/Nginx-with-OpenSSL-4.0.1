@@ -16,23 +16,25 @@ jobs:
       with:
         go-version: '1.22'
 
-    - name: Build binaries
+    - name: Build Windows binary
       run: |
         go mod init reality-scanner
+        
+        # Скачиваем основные зависимости явно (для надежности перед tidy)
         go get github.com/refraction-networking/utls
         go get golang.org/x/net/http2/hpack
+        go get github.com/ameshkov/dnscrypt/v2
+        go get github.com/ameshkov/dnsstamps
+        go get github.com/miekg/dns
+        go get github.com/oschwald/geoip2-golang
+        
         go mod tidy
         
-        # 1. Сборка для Linux
-        GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o reality-scanner-linux main.go
-        
-        # 2. Сборка для Windows
-        GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o reality-scanner-windows.exe main.go
+        # Сборка только для Windows. Флаги -s -w уменьшают размер exe файла.
+        GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o reality-scanner.exe main.go
 
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: reality-scanner-binaries
-        path: |
-          reality-scanner-linux
-          reality-scanner-windows.exe
+        name: reality-scanner-windows
+        path: reality-scanner.exe
