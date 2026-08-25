@@ -58,7 +58,7 @@ const (
 	FlagPriority   = 0x20
 	FlagAck        = 0x01
 
-	dnsFastPoolSize = 32
+	dnsFastPoolSize = 128 // ИСПРАВЛЕНИЕ: Увеличен пул используемых быстрых резолверов
 
 	LimitMaxIPs          = 262144
 	MaxDiscoveredDomains = 50000
@@ -92,6 +92,7 @@ var (
 type Config struct {
 	Mode             Mode
 	Workers          int
+	DNSWorkers       int // ИСПРАВЛЕНИЕ: Раздельный лимит для DNS-воркеров
 	MaxIPs           int
 	TCPTimeoutMs     int
 	TLSTimeoutMs     int
@@ -254,7 +255,7 @@ type PipelineStats struct {
 	EndStreamOK           int
 	H2HPACKErrors         int
 	H2Timeouts            int
-	H2InvalidStatus       int // ИСПРАВЛЕНИЕ: Новая телеметрия для H2 без статус-кода
+	H2InvalidStatus       int
 	ScoreRejected         int
 	IPWithPTR             int
 	IPWithDirectTLS       int
@@ -1089,7 +1090,7 @@ func activeProbeIP(ctx context.Context, ip string, pool *DNSPool, timeout time.D
 								if !noTLS {
 									cDoms := extractDomainsFromTLS(ctx, ip, ptrDomain, timeout)
 									for _, cd := range cDoms {
-										addDomain(cd, SourceDirectTLS) // SAN-домены обогащаются как DirectTLS
+										addDomain(cd, SourceDirectTLS)
 									}
 								}
 							}
@@ -1133,7 +1134,6 @@ func activeProbeIP(ctx context.Context, ip string, pool *DNSPool, timeout time.D
 	// 4. ДЕДУПЛИКАЦИЯ И УМНАЯ ОБРЕЗКА (max 5)
 	uniqueDoms := uniqueStrings(allDoms)
 	
-	// ИСПРАВЛЕНИЕ: Сортируем домены по "качеству" источника перед обрезкой
 	sort.Slice(uniqueDoms, func(i, j int) bool {
 		srcI := sourceMap[uniqueDoms[i]]
 		srcJ := sourceMap[uniqueDoms[j]]
@@ -1464,7 +1464,7 @@ func ProbeH2(ctx context.Context, ip, sni string, ev DomainSource, cfg Config) (
 		Evidence:      ev,
 		DomainQuality: classifyDomainQuality(sni),
 		CDNStatus:     CDNStatusUnknown,
-		HTTPStatus:    0, // ИСПРАВЛЕНИЕ: Честный статус, ждем ответа сервера
+		HTTPStatus:    0,
 	}
 
 	t0 := time.Now()
@@ -1690,7 +1690,7 @@ ReadLoop:
 							cand.Timings.H2Headers = time.Since(requestSent)
 							cand.H2HeadersReceived = true
 
-							break ReadLoop // ИСПРАВЛЕНИЕ: Мгновенный выход после получения HEADERS
+							break ReadLoop 
 						} else if isTrailers {
 							parseTrailers(cand, headers)
 						}
@@ -1816,14 +1816,7 @@ func scoreH2Profile(c *Candidate) float64 {
 }
 
 func validateAndEnrich(cand *Candidate, cfg Config, pipeStats *PipelineStats) bool {
-	// ИСПРАВЛЕНИЕ: Жесткая валидация. Кандидат ДОЛЖЕН вернуть заголовки и статус, иначе это мусор
-	if !cand.H2ProtocolConfirmed {
-		return false
-	}
-	if !cand.H2HeadersReceived {
-		return false
-	}
-	if cand.MissingStatus || cand.HTTPStatus <= 0 {
+	if !cand.H2ProtocolConfirmed || !cand.H2HeadersReceived || cand.MissingStatus || cand.HTTPStatus <= 0 {
 		return false
 	}
 
@@ -2042,7 +2035,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	var uniqueTargetIPs sync.Map
 
 	gD, gCtxD := errgroup.WithContext(ctx)
-	gD.SetLimit(cfg.Workers)
+	gD.SetLimit(cfg.DNSWorkers)
 	for dom, src := range discoveredDomains {
 		if cfg.Mode == ModeDirect && dom == CleanDomain(cfg.DirectSNI) {
 			continue
@@ -2130,6 +2123,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 			return nil
 		})
 	}
+	
 	if err := gD.Wait(); err != nil || ctx.Err() != nil {
 		fmt.Println("[-] Выполнение прервано (Stage D).")
 		return nil
@@ -2150,7 +2144,11 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	pipeStats.DNSUniqueResolvedIPs = uniqueResolvedCount
 	pipeStats.DNSUniqueTargetIPs = uniqueTargetCount
 	pipeStats.DNSValidPairs = len(validPairs)
-	fmt.Printf("[+] Stage D Завершён. Подтверждено DNS-пар (IP+SNI): %d\n", pipeStats.DNSValidPairs)
+
+	fmt.Printf("[+] Stage D Завершён.\n")
+	fmt.Printf("    - DNS Queries: %d (Success: %d, Failed: %d)\n", pipeStats.DNSQueries, pipeStats.DNSSuccess, pipeStats.DNSFailed)
+	fmt.Printf("    - NXDOMAIN: %d, Timeout: %d, OtherErr: %d, NoIPv4: %d\n", pipeStats.DNSNXDomain, pipeStats.DNSTimeout, pipeStats.DNSOtherErr, pipeStats.DNSNoIPv4)
+	fmt.Printf("    - Подтверждено DNS-пар (IP+SNI): %d\n", pipeStats.DNSValidPairs)
 	pipeStats.mu.Unlock()
 
 	if len(validPairs) == 0 {
@@ -2193,7 +2191,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 			if cand != nil && cand.ReadTimeout {
 				pipeStats.H2Timeouts++
 			}
-			if cand != nil && cand.H2ProtocolConfirmed && cand.HTTPStatus <= 0 {
+			if cand != nil && cand.H2ProtocolConfirmed && (cand.MissingStatus || cand.HTTPStatus <= 0) {
 				pipeStats.H2InvalidStatus++
 			}
 
@@ -2310,6 +2308,7 @@ func main() {
 
 	flag.StringVar(&modeStr, "mode", "autonomous", "autonomous | direct")
 	flag.IntVar(&cfg.Workers, "w", 30, "Worker pool size for generic tasks")
+	flag.IntVar(&cfg.DNSWorkers, "dns-workers", 128, "Worker pool size for DNS validation")
 	flag.IntVar(&cfg.MaxIPs, "max-ips", 0, "Limit for IP sampling (0 = no hard limit, will scan all generated IPs)")
 	flag.IntVar(&cfg.TCPTimeoutMs, "tcp-timeout", 2000, "TCP timeout ms")
 	flag.IntVar(&cfg.TLSTimeoutMs, "tls-timeout", 2000, "TLS timeout ms")
@@ -2335,6 +2334,9 @@ func main() {
 
 	if cfg.Workers < 1 {
 		cfg.Workers = 1
+	}
+	if cfg.DNSWorkers < 1 {
+		cfg.DNSWorkers = 1
 	}
 	cfg.Mode = Mode(modeStr)
 	cfg.CIDRs = flag.Args()
@@ -2439,6 +2441,7 @@ func main() {
 
 		sampledIPs := generateIPs(targetPrefixes, cfg.MaxIPs)
 		
+		// Намеренно используем все префиксы ASN для DNS валидации для расширения поиска REALITY кандидатов
 		dnsRanges := MergeCIDRs(allPrefixes)
 
 		fmt.Printf("[*] Целевой IP:             %s\n", vpsQueryIP)
