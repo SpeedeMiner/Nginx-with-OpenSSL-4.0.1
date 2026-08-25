@@ -100,6 +100,8 @@ type Config struct {
 	ECSIP             string
 	ECSPrefix         int
 	DNSResolvers      []string
+	DNSTrace          bool
+	DNSTraceLimit     int
 	Seed              int64
 	TargetASN         string
 	TargetCountry     string
@@ -305,16 +307,42 @@ func NewPipelineStats() *PipelineStats {
 	return &PipelineStats{}
 }
 
+type DNSResolverStat struct {
+	Attempts int
+	Answers  int
+	NXDomain int
+	Failures int
+	Timeouts int
+	IPv4s    int
+}
+
 type RuntimeCaches struct {
-	DNSCache *SafeDNSCache
-	DNSGroup *singleflight.Group
+	DNSCache         *SafeDNSCache
+	DNSGroup         *singleflight.Group
+	DNSStatsMu       sync.Mutex
+	DNSResolverStats map[string]*DNSResolverStat
+	DNSTraceMu       sync.Mutex
+	DNSTraceSeen     map[string]struct{}
+	DNSTracePrinted  int
 }
 
 func NewRuntimeCaches() *RuntimeCaches {
 	return &RuntimeCaches{
-		DNSCache: NewSafeDNSCache(),
-		DNSGroup: &singleflight.Group{},
+		DNSCache:         NewSafeDNSCache(),
+		DNSGroup:         &singleflight.Group{},
+		DNSResolverStats: make(map[string]*DNSResolverStat),
 	}
+}
+
+func (r *RuntimeCaches) dnsResolverStat(resolver string) *DNSResolverStat {
+	r.DNSStatsMu.Lock()
+	defer r.DNSStatsMu.Unlock()
+	stat, ok := r.DNSResolverStats[resolver]
+	if !ok {
+		stat = &DNSResolverStat{}
+		r.DNSResolverStats[resolver] = stat
+	}
+	return stat
 }
 
 type DNSCacheEntry struct {
@@ -1122,7 +1150,117 @@ func dnsExchangeUDP(ctx context.Context, resolver, domain, ecsIP string, ecsPref
 	return ips, parseErr
 }
 
-func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, resolvers []string, timeout time.Duration) ([]string, error) {
+func (r *RuntimeCaches) claimDNSTrace(domain string, limit int) bool {
+	if limit == 0 {
+		return false
+	}
+	r.DNSTraceMu.Lock()
+	defer r.DNSTraceMu.Unlock()
+	if _, ok := r.DNSTraceSeen[domain]; ok {
+		return false
+	}
+	if limit > 0 && r.DNSTracePrinted >= limit {
+		return false
+	}
+	r.DNSTraceSeen[domain] = struct{}{}
+	r.DNSTracePrinted++
+	return true
+}
+
+type dnsTraceResult struct {
+	resolver string
+	ips      []string
+	err      error
+}
+
+func resolveHostECSAllResolvers(ctx context.Context, domain, ecsIP string, ecsPrefix int, resolvers []string, timeout time.Duration, rtCaches *RuntimeCaches) ([]string, error) {
+	results := make(chan dnsTraceResult, len(resolvers))
+	var wg sync.WaitGroup
+
+	for _, resolver := range resolvers {
+		resolver := resolver
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			stat := rtCaches.dnsResolverStat(resolver)
+			rtCaches.DNSStatsMu.Lock()
+			stat.Attempts++
+			rtCaches.DNSStatsMu.Unlock()
+
+			ips, err := dnsExchangeUDP(ctx, resolver, domain, ecsIP, ecsPrefix, timeout)
+
+			rtCaches.DNSStatsMu.Lock()
+			if err == nil {
+				stat.Answers++
+				stat.IPv4s += len(ips)
+			} else if errors.Is(err, ErrDNSNXDomain) {
+				stat.NXDomain++
+			} else {
+				stat.Failures++
+				if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
+					stat.Timeouts++
+				}
+			}
+			rtCaches.DNSStatsMu.Unlock()
+
+			results <- dnsTraceResult{resolver: resolver, ips: ips, err: err}
+		}()
+	}
+
+	wg.Wait()
+	close(results)
+
+	all := make([]dnsTraceResult, 0, len(resolvers))
+	resultByResolver := make(map[string]dnsTraceResult, len(resolvers))
+	var firstErr error
+	for r := range results {
+		all = append(all, r)
+		resultByResolver[r.resolver] = r
+		if firstErr == nil && r.err != nil {
+			firstErr = r.err
+		}
+	}
+
+	// Keep the normal resolver-pool ordering semantics even though trace mode
+	// sends the diagnostic queries concurrently.
+	var winner []string
+	for _, resolver := range resolvers {
+		if r, ok := resultByResolver[resolver]; ok && r.err == nil && len(r.ips) > 0 {
+			winner = append([]string(nil), r.ips...)
+			break
+		}
+	}
+
+	sort.Slice(all, func(i, j int) bool { return all[i].resolver < all[j].resolver })
+	fmt.Printf("[DNS-TRACE] %s (ECS %s/%d)\n", domain, ecsIP, ecsPrefix)
+	for _, r := range all {
+		switch {
+		case r.err == nil:
+			ans := "NO-IPv4"
+			if len(r.ips) > 0 {
+				ans = strings.Join(r.ips, ", ")
+			}
+			fmt.Printf("    %-15s -> %s\n", r.resolver, ans)
+		case errors.Is(r.err, ErrDNSNXDomain):
+			fmt.Printf("    %-15s -> NXDOMAIN\n", r.resolver)
+		default:
+			fmt.Printf("    %-15s -> ERR: %v\n", r.resolver, r.err)
+		}
+	}
+
+	if len(winner) > 0 {
+		return winner, nil
+	}
+	if errors.Is(firstErr, ErrDNSNXDomain) {
+		return nil, ErrDNSNXDomain
+	}
+	if firstErr == nil {
+		firstErr = fmt.Errorf("all DNS resolvers returned no IPv4")
+	}
+	return nil, firstErr
+}
+
+func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, resolvers []string, timeout time.Duration, rtCaches *RuntimeCaches) ([]string, error) {
 	domain = CleanDomain(domain)
 	if domain == "" {
 		return nil, fmt.Errorf("invalid domain")
@@ -1145,14 +1283,31 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 		// Rotate the pool per logical lookup for distribution.
 		idx := (int(start) + i) % len(resolvers)
 		resolver := resolvers[idx]
+		stat := rtCaches.dnsResolverStat(resolver)
+		rtCaches.DNSStatsMu.Lock()
+		stat.Attempts++
+		rtCaches.DNSStatsMu.Unlock()
 
 		ips, err := dnsExchangeUDP(ctx, resolver, domain, ecsIP, ecsPrefix, timeout)
 		if err == nil {
+			rtCaches.DNSStatsMu.Lock()
+			stat.Answers++
+			stat.IPv4s += len(ips)
+			rtCaches.DNSStatsMu.Unlock()
 			return ips, nil
 		}
 		if errors.Is(err, ErrDNSNXDomain) {
+			rtCaches.DNSStatsMu.Lock()
+			stat.NXDomain++
+			rtCaches.DNSStatsMu.Unlock()
 			return nil, ErrDNSNXDomain
 		}
+		rtCaches.DNSStatsMu.Lock()
+		stat.Failures++
+		if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
+			stat.Timeouts++
+		}
+		rtCaches.DNSStatsMu.Unlock()
 		lastErr = fmt.Errorf("%s: %w", resolver, err)
 
 		if ctx.Err() != nil {
@@ -1184,14 +1339,20 @@ func resolveHostCached(ctx context.Context, domain string, rtCaches *RuntimeCach
 			return cached.IPs, nil
 		}
 
-		ips, err := resolveHostECS(
-			ctx,
-			domain,
-			cfg.ECSIP,
-			cfg.ECSPrefix,
-			cfg.DNSResolvers,
-			time.Duration(cfg.DNSQueryTimeoutMs)*time.Millisecond,
-		)
+		var ips []string
+		var err error
+		traceThisDomain := cfg.DNSTrace && rtCaches.claimDNSTrace(domain, cfg.DNSTraceLimit)
+		if traceThisDomain {
+			ips, err = resolveHostECSAllResolvers(
+				ctx, domain, cfg.ECSIP, cfg.ECSPrefix, cfg.DNSResolvers,
+				time.Duration(cfg.DNSQueryTimeoutMs)*time.Millisecond, rtCaches,
+			)
+		} else {
+			ips, err = resolveHostECS(
+				ctx, domain, cfg.ECSIP, cfg.ECSPrefix, cfg.DNSResolvers,
+				time.Duration(cfg.DNSQueryTimeoutMs)*time.Millisecond, rtCaches,
+			)
+		}
 		if err != nil {
 			if errors.Is(err, ErrDNSNXDomain) {
 				rtCaches.DNSCache.Put(cacheKey, &DNSCacheEntry{NXDomain: true}, 10*time.Second)
@@ -2334,6 +2495,19 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	fmt.Printf("[*] Logical DNS Lookups:       %d (Успех: %d, Ошибок: %d)\n", s.DNSQueries, s.DNSSuccess, s.DNSFailed)
 	fmt.Printf("    Детали DNS успехов:        Resolved IPs: %d, NXDOMAIN: %d, NoIPv4: %d\n", s.DNSResolvedIPs, s.DNSNXDomain, s.DNSNoIPv4)
 	fmt.Printf("    Детали DNS ошибок:         Timeout: %d, Temporary: %d, Other: %d\n", s.DNSTimeout, s.DNSTemporary, s.DNSOtherErr)
+
+	fmt.Println("    DNS resolver telemetry:")
+	rtCaches.DNSStatsMu.Lock()
+	resolverNames := make([]string, 0, len(rtCaches.DNSResolverStats))
+	for resolver := range rtCaches.DNSResolverStats {
+		resolverNames = append(resolverNames, resolver)
+	}
+	sort.Strings(resolverNames)
+	for _, resolver := range resolverNames {
+		st := rtCaches.DNSResolverStats[resolver]
+		fmt.Printf("      %-16s attempts=%-4d answers=%-4d nx=%-4d fail=%-4d timeout=%-4d IPv4=%d\n", resolver, st.Attempts, st.Answers, st.NXDomain, st.Failures, st.Timeouts, st.IPv4s)
+	}
+	rtCaches.DNSStatsMu.Unlock()
 	fmt.Printf("    Детали PTR запросов:       Sent: %d, Found: %d, Err: %d\n", s.PTRQueriesSent, s.PTRFound, s.PTRErrors)
 	fmt.Printf("[*] Target Range IP Matches:   %d\n", s.DNSTargetRangeMatches)
 	fmt.Printf("[*] Подтверждено DNS-пар:      %d\n\n", s.DNSValidPairs)
@@ -2351,6 +2525,19 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	fmt.Printf("    *  Уникальных IP-кластеров:    %d\n", len(ipClusters))
 	s.mu.Unlock()
 
+	if cfg.DNSTrace {
+		fmt.Printf("\n[*] DNS resolver aggregate telemetry:\n")
+		rtCaches.DNSStatsMu.Lock()
+		for _, resolver := range cfg.DNSResolvers {
+			stat := rtCaches.DNSResolverStats[resolver]
+			if stat == nil {
+				continue
+			}
+			fmt.Printf("    %-15s attempts=%d answers=%d ipv4=%d nxdomain=%d failures=%d timeouts=%d\n", resolver, stat.Attempts, stat.Answers, stat.IPv4s, stat.NXDomain, stat.Failures, stat.Timeouts)
+		}
+		rtCaches.DNSStatsMu.Unlock()
+	}
+
 	return candidates
 }
 
@@ -2365,6 +2552,8 @@ func main() {
 	flag.IntVar(&cfg.DNSWorkers, "dns-workers", 128, "Worker pool size for DNS validation")
 	flag.IntVar(&cfg.DNSQueryTimeoutMs, "dns-timeout", 1500, "Per-resolver raw UDP DNS timeout ms")
 	flag.IntVar(&cfg.ECSPrefix, "ecs-prefix", 24, "EDNS Client Subnet IPv4 prefix length (0..32, default 24)")
+	flag.BoolVar(&cfg.DNSTrace, "dns-trace", false, "Query every configured resolver for selected domains and print resolver -> A records")
+	flag.IntVar(&cfg.DNSTraceLimit, "dns-trace-limit", 20, "Maximum number of unique domains to compare in -dns-trace (0 = unlimited)")
 	var dnsResolversStr string
 	flag.StringVar(&dnsResolversStr, "dns", DefaultDNSResolvers, "Comma-separated raw UDP DNS resolver IPv4 addresses")
 	flag.IntVar(&cfg.MaxIPs, "max-ips", 0, "Limit for IP sampling (0 = no hard limit, will scan all generated IPs)")
@@ -2395,6 +2584,9 @@ func main() {
 	}
 	if cfg.ECSPrefix < 0 || cfg.ECSPrefix > 32 {
 		log.Fatalf("[-] -ecs-prefix must be between 0 and 32")
+	}
+	if cfg.DNSTraceLimit < 0 {
+		cfg.DNSTraceLimit = 0
 	}
 	cfg.DNSResolvers = normalizeDNSResolvers(strings.Split(dnsResolversStr, ","))
 	if len(cfg.DNSResolvers) == 0 {
@@ -2471,8 +2663,31 @@ func main() {
 		}
 	}
 
-	fmt.Printf("[*] ECS client IP:          %s/%d\n", cfg.ECSIP, cfg.ECSPrefix)
+	maskedECSIP := cfg.ECSIP
+	if parsed := net.ParseIP(cfg.ECSIP); parsed != nil && parsed.To4() != nil {
+		masked := append(net.IP(nil), parsed.To4()...)
+		usedBytes := (cfg.ECSPrefix + 7) / 8
+		if usedBytes > 0 && cfg.ECSPrefix%8 != 0 {
+			masked[usedBytes-1] &= byte(0xFF << uint(8-(cfg.ECSPrefix%8)))
+		}
+		for i := usedBytes; i < 4; i++ {
+			masked[i] = 0
+		}
+		if cfg.ECSPrefix == 0 {
+			masked[0], masked[1], masked[2], masked[3] = 0, 0, 0, 0
+		}
+		maskedECSIP = net.IP(masked).String()
+	}
+	fmt.Printf("[*] ECS client IP:          %s/%d (wire=%s/%d)\n", cfg.ECSIP, cfg.ECSPrefix, maskedECSIP, cfg.ECSPrefix)
 	fmt.Printf("[*] Raw UDP DNS pool:       %s\n", strings.Join(cfg.DNSResolvers, ", "))
+	fmt.Printf("[*] ECS mode:               RFC7871 IPv4, scope=0; use -ecs-prefix 32 for host-specific ECS\n")
+	if cfg.DNSTrace {
+		limitText := "unlimited"
+		if cfg.DNSTraceLimit > 0 {
+			limitText = strconv.Itoa(cfg.DNSTraceLimit)
+		}
+		fmt.Printf("[*] DNS resolver compare:   enabled (unique domains: %s; all resolvers queried)\n", limitText)
+	}
 
 	var results []Candidate
 
