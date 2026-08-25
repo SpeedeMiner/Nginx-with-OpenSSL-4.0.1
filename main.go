@@ -331,6 +331,7 @@ func NewRuntimeCaches() *RuntimeCaches {
 		DNSCache:         NewSafeDNSCache(),
 		DNSGroup:         &singleflight.Group{},
 		DNSResolverStats: make(map[string]*DNSResolverStat),
+		DNSTraceSeen:     make(map[string]struct{}),
 	}
 }
 
@@ -1156,6 +1157,9 @@ func (r *RuntimeCaches) claimDNSTrace(domain string, limit int) bool {
 	}
 	r.DNSTraceMu.Lock()
 	defer r.DNSTraceMu.Unlock()
+	if r.DNSTraceSeen == nil {
+		r.DNSTraceSeen = make(map[string]struct{})
+	}
 	if _, ok := r.DNSTraceSeen[domain]; ok {
 		return false
 	}
