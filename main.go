@@ -20,6 +20,7 @@ import (
 	"os/signal"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,6 +33,7 @@ import (
 	"github.com/oschwald/geoip2-golang"
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2/hpack"
+	"golang.org/x/net/publicsuffix"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
 )
@@ -83,6 +85,12 @@ var (
 	domainRe = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$`)
 	numRe    = regexp.MustCompile(`(?i)(^|\.)\d+\.[a-z]{2,}$`)
 	stampRe  = regexp.MustCompile(`^sdns://[A-Za-z0-9_-]+=*$`)
+
+	ErrProviderNoData = errors.New("provider returned no data")
+	ErrDNSNXDomain    = errors.New("NXDOMAIN")
+
+	uaRng *rand.Rand
+	uaMu  sync.Mutex
 )
 
 type Config struct {
@@ -107,7 +115,7 @@ type Config struct {
 	NoActiveTLS      bool
 }
 
-// ================= EVIDENCE & PROVENANCE =================
+// ================= EVIDENCE =================
 
 type DomainSource uint32
 
@@ -125,62 +133,6 @@ type Evidence struct {
 }
 
 func (e Evidence) Combined() DomainSource { return e.Direct | e.Inherited }
-
-type DiscoveryState struct {
-	mu                          sync.RWMutex
-	domainEvidence              map[string]Evidence
-	pairEvidence                map[string]Evidence
-	domainsToResolve            map[string]struct{}
-	domainsCount                int
-	droppedDomainsByGlobalLimit int
-	droppedValidPairs           int
-}
-
-func NewDiscoveryState() *DiscoveryState {
-	return &DiscoveryState{
-		domainEvidence:   make(map[string]Evidence),
-		pairEvidence:     make(map[string]Evidence),
-		domainsToResolve: make(map[string]struct{}),
-	}
-}
-
-func (s *DiscoveryState) AddDomainSource(d string, direct, inherited DomainSource) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if _, exists := s.domainsToResolve[d]; !exists {
-		if s.domainsCount >= MaxDiscoveredDomains {
-			s.droppedDomainsByGlobalLimit++
-			return
-		}
-		s.domainsToResolve[d] = struct{}{}
-		s.domainsCount++
-	}
-
-	ev := s.domainEvidence[d]
-	ev.Direct |= direct
-	ev.Inherited |= inherited
-	s.domainEvidence[d] = ev
-}
-
-func (s *DiscoveryState) AddPairSource(ip, d string, src DomainSource) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if _, exists := s.domainsToResolve[d]; !exists {
-		if s.domainsCount >= MaxDiscoveredDomains {
-			s.droppedDomainsByGlobalLimit++
-			return
-		}
-		s.domainsToResolve[d] = struct{}{}
-		s.domainsCount++
-	}
-
-	key := ip + "\x00" + d
-	evP := s.pairEvidence[key]
-	evP.Direct |= src
-	s.pairEvidence[key] = evP
-}
 
 // ================= MODELS =================
 
@@ -282,8 +234,6 @@ type TargetPair struct {
 type PipelineStats struct {
 	mu                    sync.Mutex
 	IPSampled             int
-	IPWithPTR             int
-	IPWithDirectTLS       int
 	ActiveProbes          int
 	UniqueDomains         int
 	DNSQueries            int
@@ -291,14 +241,9 @@ type PipelineStats struct {
 	DNSFailed             int
 	DNSNXDomain           int
 	DNSTimeout            int
-	DNSTemporary          int
-	DNSNoIPv4             int
 	DNSOtherErr           int
 	DNSResolvedIPs        int
-	DNSUniqueResolvedIPs  int
-	DNSUniqueTargetIPs    int
 	DNSTargetRangeMatches int
-	DNSTargetDomains      int
 	DNSValidPairs         int
 	TCPConnected          int
 	TLSHandshake          int
@@ -308,7 +253,8 @@ type PipelineStats struct {
 	EndStreamOK           int
 	ASNFiltered           int
 	CountryFiltered       int
-	CDNDropped            int
+	IPWithPTR             int
+	IPWithDirectTLS       int
 }
 
 func NewPipelineStats() *PipelineStats {
@@ -780,6 +726,18 @@ func CleanDomain(d string) string {
 	return d
 }
 
+func GetRootDomain(domain string) string {
+	domain = CleanDomain(domain)
+	if domain == "" {
+		return ""
+	}
+	root, err := publicsuffix.EffectiveTLDPlusOne(domain)
+	if err != nil {
+		return ""
+	}
+	return root
+}
+
 func uniqueStrings(values []string) []string {
 	seen := make(map[string]bool)
 	var result []string
@@ -874,6 +832,7 @@ func activeProbeIP(ctx context.Context, ip string, pool *DNSPool, timeout time.D
 						if d := CleanDomain(ptr.Ptr); d != "" {
 							results[d] |= SourcePTR
 							
+							// Fallback TLS using PTR as SNI
 							if !noTLS {
 								cDoms := extractDomainsFromTLS(ctx, ip, d, timeout)
 								if len(cDoms) > 0 && len(cDoms) <= 15 {
@@ -891,7 +850,62 @@ func activeProbeIP(ctx context.Context, ip string, pool *DNSPool, timeout time.D
 	return results
 }
 
-var ErrDNSNXDomain = errors.New("NXDOMAIN")
+func resolvePTRDNSCrypt(ctx context.Context, pool *DNSPool, ip string) ([]string, error) {
+	rev, err := reverseIPv4(ip)
+	if err != nil {
+		return nil, err
+	}
+	req := new(mdns.Msg)
+	req.SetQuestion(rev, mdns.TypePTR)
+	req.RecursionDesired = true
+	resp, _, _, err := pool.exchange(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Rcode == mdns.RcodeNameError {
+		return nil, ErrDNSNXDomain
+	}
+	if resp.Rcode != mdns.RcodeSuccess {
+		return nil, fmt.Errorf("DNS response code: %s", mdns.RcodeToString[resp.Rcode])
+	}
+	var names []string
+	for _, ans := range resp.Answer {
+		if ptr, ok := ans.(*mdns.PTR); ok {
+			if d := CleanDomain(ptr.Ptr); d != "" {
+				names = append(names, d)
+			}
+		}
+	}
+	return names, nil
+}
+
+func resolveIPv4DNSCrypt(ctx context.Context, pool *DNSPool, domain string) ([]string, error) {
+	req := new(mdns.Msg)
+	req.SetQuestion(mdns.Fqdn(domain), mdns.TypeA)
+	req.RecursionDesired = true
+	resp, _, _, err := pool.exchange(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Rcode == mdns.RcodeNameError {
+		return nil, ErrDNSNXDomain
+	}
+	if resp.Rcode != mdns.RcodeSuccess {
+		return nil, fmt.Errorf("DNS response code: %s", mdns.RcodeToString[resp.Rcode])
+	}
+	seen := make(map[string]struct{})
+	var ips []string
+	for _, answer := range resp.Answer {
+		if a, ok := answer.(*mdns.A); ok {
+			ip := a.A.String()
+			if _, exists := seen[ip]; !exists {
+				seen[ip] = struct{}{}
+				ips = append(ips, ip)
+			}
+		}
+	}
+	return ips, nil
+}
 
 func resolveIPv4Cached(ctx context.Context, pool *DNSPool, domain string, rtCaches *RuntimeCaches) ([]string, error) {
 	domain = CleanDomain(domain)
@@ -1190,25 +1204,6 @@ func reverseIPv4(ip string) (string, error) {
 }
 
 // ================= HTTP/2 PROBE =================
-const clientAdvertisedMaxFrameSize = 16384
-
-type ProbeStage int
-
-const (
-	ProbeStageTCP ProbeStage = iota
-	ProbeStageTLS
-	ProbeStageTLSValidation
-	ProbeStageH2
-	ProbeStageHeaders
-	ProbeStageComplete
-)
-
-type ProbeError struct {
-	Stage ProbeStage
-	Err   error
-}
-
-func (e *ProbeError) Error() string { return e.Err.Error() }
 
 func writeH2(conn net.Conn, b []byte, timeout time.Duration) error {
 	conn.SetWriteDeadline(time.Now().Add(timeout))
