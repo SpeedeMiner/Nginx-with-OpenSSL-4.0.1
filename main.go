@@ -63,7 +63,7 @@ const (
 	// Google Public DNS supports ECS; Quad9 exposes dedicated ECS endpoints.
 	// OpenDNS is kept as an optional fallback for availability, but we do not
 	// assume it will forward a caller-supplied ECS option.
-	DefaultDNSResolvers = "8.8.8.8,8.8.4.4,9.9.9.11,149.112.112.11,9.9.9.12,149.112.112.12,208.67.222.222,208.67.220.220"
+	DefaultDNSResolvers = "8.8.8.8,8.8.4.4,9.9.9.11,149.112.112.11,9.9.9.12,149.112.112.12,208.67.222.222,77.88.8.8,208.67.220.220"
 )
 
 var (
