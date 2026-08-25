@@ -54,10 +54,16 @@ const (
 	FlagPriority   = 0x20
 	FlagAck        = 0x01
 
-	LimitMaxIPs          = 262144
-	LimitValidPairs      = 10000
-	MaxHostsPer24        = 254
-	MaxSampled24         = 4
+	LimitMaxIPs     = 262144
+	LimitValidPairs = 10000
+	MaxHostsPer24   = 254
+	MaxSampled24    = 4
+
+	// Public recursive resolvers with documented ECS-capable endpoints.
+	// Google Public DNS supports ECS; Quad9 exposes dedicated ECS endpoints.
+	// OpenDNS is kept as an optional fallback for availability, but we do not
+	// assume it will forward a caller-supplied ECS option.
+	DefaultDNSResolvers = "8.8.8.8,8.8.4.4,9.9.9.11,149.112.112.11,9.9.9.12,149.112.112.12,208.67.222.222,208.67.220.220"
 )
 
 var (
@@ -82,23 +88,27 @@ var (
 )
 
 type Config struct {
-	Mode             Mode
-	Workers          int
-	DNSWorkers       int
-	MaxIPs           int
-	TCPTimeoutMs     int
-	TLSTimeoutMs     int
-	H2ReadTimeoutMs  int
-	H2WriteTimeoutMs int
-	Seed             int64
-	TargetASN        string
-	TargetCountry    string
-	TargetIP         string
-	DirectSNI        string
-	CIDRs            []string
-	Domains          []string
-	NoPTR            bool
-	NoActiveTLS      bool
+	Mode              Mode
+	Workers           int
+	DNSWorkers        int
+	MaxIPs            int
+	TCPTimeoutMs      int
+	TLSTimeoutMs      int
+	H2ReadTimeoutMs   int
+	H2WriteTimeoutMs  int
+	DNSQueryTimeoutMs int
+	ECSIP             string
+	ECSPrefix         int
+	DNSResolvers      []string
+	Seed              int64
+	TargetASN         string
+	TargetCountry     string
+	TargetIP          string
+	DirectSNI         string
+	CIDRs             []string
+	Domains           []string
+	NoPTR             bool
+	NoActiveTLS       bool
 }
 
 // ================= EVIDENCE =================
@@ -220,10 +230,10 @@ type TargetPair struct {
 // ================= TELEMETRY & CACHES =================
 
 type PipelineStats struct {
-	mu                    sync.Mutex
-	IPSampled             int
-	ActiveProbes          int
-	UniqueDomains         int
+	mu            sync.Mutex
+	IPSampled     int
+	ActiveProbes  int
+	UniqueDomains int
 
 	// DNS
 	DNSQueries            int
@@ -709,7 +719,7 @@ func activeProbeIP(ctx context.Context, ip string, timeout time.Duration, noPTR 
 			for _, d := range doms {
 				addDomain(d, SourceDirectTLS)
 			}
-			
+
 			// Ранний выход как в старой версии
 			if len(doms) <= 15 {
 				for d, src := range sourceMap {
@@ -720,7 +730,7 @@ func activeProbeIP(ctx context.Context, ip string, timeout time.Duration, noPTR 
 		}
 	}
 
-	// 2. Нативный быстрый PTR 
+	// 2. Нативный быстрый PTR
 	if !noPTR {
 		pipeStats.mu.Lock()
 		pipeStats.PTRQueriesSent++
@@ -737,7 +747,7 @@ func activeProbeIP(ctx context.Context, ip string, timeout time.Duration, noPTR 
 				ptrDomain = CleanDomain(ptrDomain)
 				if ptrDomain != "" {
 					addDomain(ptrDomain, SourcePTR)
-					
+
 					if !noTLS {
 						cDoms, _ := extractDomainsFromTLS(ctx, ip, ptrDomain, timeout)
 						for _, cd := range cDoms {
@@ -753,7 +763,7 @@ func activeProbeIP(ctx context.Context, ip string, timeout time.Duration, noPTR 
 		}
 	}
 
-	// 3. OSINT 
+	// 3. OSINT
 	if len(sourceMap) < 5 {
 		osints := getOSINTDomains(ip)
 		for _, osint := range osints {
@@ -782,9 +792,15 @@ func activeProbeIP(ctx context.Context, ip string, timeout time.Duration, noPTR 
 	sort.Slice(pairs, func(i, j int) bool {
 		weight := func(s DomainSource) int {
 			w := 0
-			if s.Has(SourceDirectTLS) { w += 3 }
-			if s.Has(SourcePTR) { w += 2 }
-			if s.Has(SourceSeed) { w += 1 }
+			if s.Has(SourceDirectTLS) {
+				w += 3
+			}
+			if s.Has(SourcePTR) {
+				w += 2
+			}
+			if s.Has(SourceSeed) {
+				w += 1
+			}
 			return w
 		}
 		wi, wj := weight(pairs[i].Evidence), weight(pairs[j].Evidence)
@@ -801,29 +817,387 @@ func activeProbeIP(ctx context.Context, ip string, timeout time.Duration, noPTR 
 	return pairs
 }
 
-func resolveHostCached(ctx context.Context, domain string, rtCaches *RuntimeCaches) ([]string, error) {
+// ================= RAW DNS + EDNS CLIENT SUBNET =================
+
+// DNSHeader/Question/Answer parsing is intentionally minimal: Stage D only
+// needs A records and the DNS response code. We never call net.LookupHost here.
+
+func normalizeDNSResolvers(values []string) []string {
+	var out []string
+	seen := make(map[string]struct{})
+	for _, v := range values {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		if host, _, err := net.SplitHostPort(v); err == nil {
+			v = host
+		}
+		ip := net.ParseIP(v)
+		if ip == nil || ip.To4() == nil {
+			continue
+		}
+		v = ip.To4().String()
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
+func randomDNSID() uint16 {
+	uaMu.Lock()
+	defer uaMu.Unlock()
+	if uaRng == nil {
+		uaRng = rand.New(rand.NewSource(time.Now().UnixNano()))
+	}
+	return uint16(uaRng.Intn(1 << 16))
+}
+
+func encodeDNSName(name string) ([]byte, error) {
+	name = strings.TrimSuffix(strings.TrimSpace(name), ".")
+	if name == "" {
+		return []byte{0}, nil
+	}
+
+	var out []byte
+	for _, label := range strings.Split(name, ".") {
+		if label == "" || len(label) > 63 {
+			return nil, fmt.Errorf("invalid DNS label in %q", name)
+		}
+		if len(out)+1+len(label)+1 > 255 {
+			return nil, fmt.Errorf("DNS name too long: %q", name)
+		}
+		out = append(out, byte(len(label)))
+		out = append(out, label...)
+	}
+	out = append(out, 0)
+	return out, nil
+}
+
+// ECS option, RFC 7871:
+//
+//	OPTION-CODE=8, FAMILY=1 (IPv4), SOURCE PREFIX, SCOPE=0, ADDRESS bytes.
+//
+// We default to /24 because that is the commonly forwarded IPv4 ECS granularity
+// and is also the maximum prefix Google documents for client ECS forwarding.
+// The prefix is configurable through -ecs-prefix.
+func buildECSOption(clientIP string, prefixLen int) ([]byte, error) {
+	ip := net.ParseIP(clientIP)
+	if ip == nil || ip.To4() == nil {
+		return nil, fmt.Errorf("invalid ECS IPv4: %q", clientIP)
+	}
+	if prefixLen < 0 || prefixLen > 32 {
+		return nil, fmt.Errorf("invalid ECS IPv4 prefix length: %d", prefixLen)
+	}
+
+	ip4 := append([]byte(nil), ip.To4()...)
+	usedBytes := (prefixLen + 7) / 8
+	if usedBytes > 0 && prefixLen%8 != 0 {
+		maskBits := byte(0xFF << uint(8-(prefixLen%8)))
+		ip4[usedBytes-1] &= maskBits
+	}
+	ip4 = ip4[:usedBytes]
+
+	// ECS option payload:
+	// FAMILY(2) + SOURCE PREFIX(1) + SCOPE(1) + ADDRESS(variable)
+	payloadLen := 4 + len(ip4)
+	option := make([]byte, 4+payloadLen)
+	binary.BigEndian.PutUint16(option[0:2], 8) // ECS option code
+	binary.BigEndian.PutUint16(option[2:4], uint16(payloadLen))
+	binary.BigEndian.PutUint16(option[4:6], 1) // IPv4
+	option[6] = byte(prefixLen)
+	option[7] = 0 // scope prefix
+	copy(option[8:], ip4)
+	return option, nil
+}
+
+func buildDNSQuery(domain string, ecsIP string, ecsPrefix int) ([]byte, uint16, error) {
+	name, err := encodeDNSName(domain)
+	if err != nil {
+		return nil, 0, err
+	}
+	id := randomDNSID()
+
+	// Header:
+	// ID, RD=1, QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=1 (OPT)
+	buf := make([]byte, 12)
+	binary.BigEndian.PutUint16(buf[0:2], id)
+	binary.BigEndian.PutUint16(buf[2:4], 0x0100)
+	binary.BigEndian.PutUint16(buf[4:6], 1)
+	binary.BigEndian.PutUint16(buf[10:12], 1)
+
+	// Question: QNAME + QTYPE=A + QCLASS=IN
+	buf = append(buf, name...)
+	buf = append(buf, 0x00, 0x01, 0x00, 0x01)
+
+	ecs, err := buildECSOption(ecsIP, ecsPrefix)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// EDNS(0) OPT RR:
+	// NAME=0, TYPE=41, UDP payload=1232, EXT-RCODE=0, VERSION=0,
+	// FLAGS=0, RDLEN=len(ECS), RDATA=ECS option.
+	opt := make([]byte, 11)
+	// opt[0] NAME already 0
+	binary.BigEndian.PutUint16(opt[1:3], 41)
+	binary.BigEndian.PutUint16(opt[3:5], 1232)
+	// opt[5] extended RCODE, opt[6] EDNS version, opt[7:9] flags
+	binary.BigEndian.PutUint16(opt[9:11], uint16(len(ecs)))
+	buf = append(buf, opt...)
+	buf = append(buf, ecs...)
+	return buf, id, nil
+}
+
+func readDNSName(msg []byte, off int) (string, int, error) {
+	if off < 0 || off >= len(msg) {
+		return "", off, fmt.Errorf("DNS name offset out of bounds")
+	}
+
+	var labels []string
+	pos := off
+	jumped := false
+	returnPos := off
+	jumps := 0
+
+	for {
+		if pos >= len(msg) {
+			return "", off, fmt.Errorf("DNS name truncated")
+		}
+		l := msg[pos]
+		if l == 0 {
+			pos++
+			if !jumped {
+				returnPos = pos
+			}
+			return strings.Join(labels, "."), returnPos, nil
+		}
+
+		if l&0xC0 == 0xC0 {
+			if pos+1 >= len(msg) {
+				return "", off, fmt.Errorf("DNS compression pointer truncated")
+			}
+			ptr := int(l&0x3F)<<8 | int(msg[pos+1])
+			if ptr >= len(msg) {
+				return "", off, fmt.Errorf("DNS compression pointer out of bounds")
+			}
+			if !jumped {
+				returnPos = pos + 2
+				jumped = true
+			}
+			pos = ptr
+			jumps++
+			if jumps > 32 {
+				return "", off, fmt.Errorf("DNS compression loop")
+			}
+			continue
+		}
+
+		if l > 63 {
+			return "", off, fmt.Errorf("invalid DNS label length")
+		}
+		pos++
+		if pos+int(l) > len(msg) {
+			return "", off, fmt.Errorf("DNS label truncated")
+		}
+		labels = append(labels, string(msg[pos:pos+int(l)]))
+		pos += int(l)
+		if !jumped {
+			returnPos = pos
+		}
+	}
+}
+
+func parseDNSAResponse(msg []byte, wantID uint16) ([]string, int, error) {
+	if len(msg) < 12 {
+		return nil, 0, fmt.Errorf("short DNS response")
+	}
+	id := binary.BigEndian.Uint16(msg[0:2])
+	if id != wantID {
+		return nil, 0, fmt.Errorf("DNS transaction ID mismatch")
+	}
+
+	flags := binary.BigEndian.Uint16(msg[2:4])
+	if flags&0x8000 == 0 {
+		return nil, 0, fmt.Errorf("not a DNS response")
+	}
+	rcode := int(flags & 0x000F)
+
+	qd := int(binary.BigEndian.Uint16(msg[4:6]))
+	an := int(binary.BigEndian.Uint16(msg[6:8]))
+	ns := int(binary.BigEndian.Uint16(msg[8:10]))
+	ar := int(binary.BigEndian.Uint16(msg[10:12]))
+
+	// DNS RCODE 3 = NXDOMAIN. Returning ErrDNSNXDomain allows the Stage D
+	// telemetry/cache behavior to remain unchanged.
+	if rcode == 3 {
+		return nil, rcode, ErrDNSNXDomain
+	}
+	if rcode != 0 {
+		return nil, rcode, fmt.Errorf("DNS server returned RCODE=%d", rcode)
+	}
+
+	off := 12
+	for i := 0; i < qd; i++ {
+		_, next, err := readDNSName(msg, off)
+		if err != nil {
+			return nil, rcode, err
+		}
+		off = next
+		if off+4 > len(msg) {
+			return nil, rcode, fmt.Errorf("truncated DNS question")
+		}
+		off += 4
+	}
+
+	var ips []string
+	parseRR := func() error {
+		_, next, err := readDNSName(msg, off)
+		if err != nil {
+			return err
+		}
+		off = next
+		if off+10 > len(msg) {
+			return fmt.Errorf("truncated DNS RR header")
+		}
+
+		qtype := binary.BigEndian.Uint16(msg[off : off+2])
+		qclass := binary.BigEndian.Uint16(msg[off+2 : off+4])
+		rdlen := int(binary.BigEndian.Uint16(msg[off+8 : off+10]))
+		off += 10
+		if off+rdlen > len(msg) {
+			return fmt.Errorf("truncated DNS RDATA")
+		}
+
+		if qtype == 1 && qclass == 1 && rdlen == 4 {
+			ip := net.IPv4(msg[off], msg[off+1], msg[off+2], msg[off+3]).String()
+			ips = append(ips, ip)
+		}
+		off += rdlen
+		return nil
+	}
+
+	for i := 0; i < an+ns+ar; i++ {
+		if err := parseRR(); err != nil {
+			return nil, rcode, err
+		}
+	}
+
+	return uniqueStrings(ips), rcode, nil
+}
+
+func dnsExchangeUDP(ctx context.Context, resolver, domain, ecsIP string, ecsPrefix int, timeout time.Duration) ([]string, error) {
+	query, id, err := buildDNSQuery(domain, ecsIP, ecsPrefix)
+	if err != nil {
+		return nil, err
+	}
+
+	addr := net.JoinHostPort(resolver, "53")
+	dialer := net.Dialer{}
+	conn, err := dialer.DialContext(ctx, "udp", addr)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	deadline := time.Now().Add(timeout)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
+		deadline = dl
+	}
+	_ = conn.SetDeadline(deadline)
+
+	if _, err := conn.Write(query); err != nil {
+		return nil, err
+	}
+
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return nil, err
+	}
+	return parseDNSAResponse(buf[:n], id)
+}
+
+func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, resolvers []string, timeout time.Duration) ([]string, error) {
 	domain = CleanDomain(domain)
 	if domain == "" {
 		return nil, fmt.Errorf("invalid domain")
 	}
-	v, err, _ := rtCaches.DNSGroup.Do(domain, func() (interface{}, error) {
-		if cached, ok := rtCaches.DNSCache.Get(domain); ok {
+	if ecsIP == "" {
+		return nil, fmt.Errorf("ECS client IP is empty")
+	}
+	if len(resolvers) == 0 {
+		return nil, fmt.Errorf("DNS resolver pool is empty")
+	}
+	if timeout <= 0 {
+		timeout = 1500 * time.Millisecond
+	}
+
+	// Query the pool sequentially so a single broken/filtered resolver does not
+	// block the whole validation stage. A successful answer wins immediately.
+	var lastErr error
+	start := randomDNSID()
+	for i := 0; i < len(resolvers); i++ {
+		// Rotate the pool per logical lookup for distribution.
+		idx := (int(start) + i) % len(resolvers)
+		resolver := resolvers[idx]
+
+		ips, err := dnsExchangeUDP(ctx, resolver, domain, ecsIP, ecsPrefix, timeout)
+		if err == nil {
+			return ips, nil
+		}
+		if errors.Is(err, ErrDNSNXDomain) {
+			return nil, ErrDNSNXDomain
+		}
+		lastErr = fmt.Errorf("%s: %w", resolver, err)
+
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("all DNS resolvers failed")
+	}
+	return nil, lastErr
+}
+
+func resolveHostCached(ctx context.Context, domain string, rtCaches *RuntimeCaches, cfg Config) ([]string, error) {
+	domain = CleanDomain(domain)
+	if domain == "" {
+		return nil, fmt.Errorf("invalid domain")
+	}
+
+	// Cache includes the ECS client prefix. In the current scanner the ECS IP is
+	// the VPS public IP, so a single RunPipeline has a stable cache context.
+	cacheKey := fmt.Sprintf("%s|ecs=%s/%d|dns=%s",
+		domain, cfg.ECSIP, cfg.ECSPrefix, strings.Join(cfg.DNSResolvers, ","))
+
+	v, err, _ := rtCaches.DNSGroup.Do(cacheKey, func() (interface{}, error) {
+		if cached, ok := rtCaches.DNSCache.Get(cacheKey); ok {
 			if cached.NXDomain {
 				return nil, ErrDNSNXDomain
 			}
 			return cached.IPs, nil
 		}
-		
-		ips, err := net.LookupHost(domain)
+
+		ips, err := resolveHostECS(
+			ctx,
+			domain,
+			cfg.ECSIP,
+			cfg.ECSPrefix,
+			cfg.DNSResolvers,
+			time.Duration(cfg.DNSQueryTimeoutMs)*time.Millisecond,
+		)
 		if err != nil {
-			var dnsErr *net.DNSError
-			if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
-				rtCaches.DNSCache.Put(domain, &DNSCacheEntry{NXDomain: true}, 10*time.Second)
-				return nil, ErrDNSNXDomain
+			if errors.Is(err, ErrDNSNXDomain) {
+				rtCaches.DNSCache.Put(cacheKey, &DNSCacheEntry{NXDomain: true}, 10*time.Second)
 			}
 			return nil, err
 		}
-		
+
 		var validIPs []string
 		for _, ip := range ips {
 			if net.ParseIP(ip).To4() != nil {
@@ -831,7 +1205,7 @@ func resolveHostCached(ctx context.Context, domain string, rtCaches *RuntimeCach
 			}
 		}
 
-		rtCaches.DNSCache.Put(domain, &DNSCacheEntry{IPs: validIPs}, 10*time.Second)
+		rtCaches.DNSCache.Put(cacheKey, &DNSCacheEntry{IPs: validIPs}, 10*time.Second)
 		return validIPs, nil
 	})
 	if err != nil {
@@ -1308,7 +1682,7 @@ ReadLoop:
 							cand.Timings.H2Headers = time.Since(requestSent)
 							cand.H2HeadersReceived = true
 
-							break ReadLoop 
+							break ReadLoop
 						} else if isTrailers {
 							parseTrailers(cand, headers)
 						}
@@ -1654,12 +2028,12 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 				if ctx.Err() != nil {
 					return
 				}
-				
+
 				pipeStats.mu.Lock()
 				pipeStats.DNSQueries++
 				pipeStats.mu.Unlock()
 
-				ips, err := resolveHostCached(ctx, p.SNI, rtCaches)
+				ips, err := resolveHostCached(ctx, p.SNI, rtCaches, cfg)
 
 				pipeStats.mu.Lock()
 				if err != nil {
@@ -1715,14 +2089,14 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 							pairsMu.Lock()
 							if len(validPairs) < LimitValidPairs {
 								validPairs = append(validPairs, TargetPair{
-									IP:       resolvedIP, 
+									IP:       resolvedIP,
 									SNI:      p.SNI,
 									Evidence: p.Evidence,
 								})
 							}
 							pairsMu.Unlock()
 						}
-						break 
+						break
 					}
 				}
 				if matched {
@@ -1772,13 +2146,13 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 
 	h2jobs := make(chan TargetPair, len(validPairs))
 	var wgE sync.WaitGroup
-	
+
 	tcpTimeout := time.Duration(cfg.TCPTimeoutMs) * time.Millisecond
 	if tcpTimeout < 3000*time.Millisecond {
 		tcpTimeout = 3000 * time.Millisecond
 	}
 	cfg.TCPTimeoutMs = int(tcpTimeout.Milliseconds())
-	
+
 	tlsTimeout := time.Duration(cfg.TLSTimeoutMs) * time.Millisecond
 	if tlsTimeout < 3000*time.Millisecond {
 		tlsTimeout = 3000 * time.Millisecond
@@ -1988,6 +2362,10 @@ func main() {
 	flag.StringVar(&modeStr, "mode", "autonomous", "autonomous | direct")
 	flag.IntVar(&cfg.Workers, "w", 1000, "Worker pool size for TLS/TCP probing")
 	flag.IntVar(&cfg.DNSWorkers, "dns-workers", 128, "Worker pool size for DNS validation")
+	flag.IntVar(&cfg.DNSQueryTimeoutMs, "dns-timeout", 1500, "Per-resolver raw UDP DNS timeout ms")
+	flag.IntVar(&cfg.ECSPrefix, "ecs-prefix", 24, "EDNS Client Subnet IPv4 prefix length (0..32, default 24)")
+	var dnsResolversStr string
+	flag.StringVar(&dnsResolversStr, "dns", DefaultDNSResolvers, "Comma-separated raw UDP DNS resolver IPv4 addresses")
 	flag.IntVar(&cfg.MaxIPs, "max-ips", 0, "Limit for IP sampling (0 = no hard limit, will scan all generated IPs)")
 	flag.IntVar(&cfg.TCPTimeoutMs, "tcp-timeout", 3000, "TCP timeout ms")
 	flag.IntVar(&cfg.TLSTimeoutMs, "tls-timeout", 3000, "TLS timeout ms")
@@ -1995,7 +2373,8 @@ func main() {
 	flag.IntVar(&cfg.H2WriteTimeoutMs, "h2-write", 2000, "H2 Write timeout ms")
 	flag.StringVar(&cfg.TargetCountry, "c", "", "Hard Filter: Target Country Code")
 	flag.StringVar(&cfg.TargetASN, "asn", "", "Hard Filter: Target ASN constraint (e.g., AS12345)")
-	flag.StringVar(&cfg.TargetIP, "vps-ip", "", "IP сервера для поиска сети (запуск с ПК)")
+	flag.StringVar(&cfg.TargetIP, "vps-ip", "", "IP сервера для поиска сети (запуск с ПК); также используется как ECS IP, если -ecs-ip не задан")
+	flag.StringVar(&cfg.ECSIP, "ecs-ip", "", "Explicit IPv4 address to place into EDNS Client Subnet")
 	flag.StringVar(&cfg.DirectSNI, "sni", "", "Fallback SNI for Direct mode")
 	flag.StringVar(&domainsStr, "domains", "", "Comma-separated seed domains for OSINT")
 
@@ -2009,6 +2388,16 @@ func main() {
 	}
 	if cfg.DNSWorkers < 1 {
 		cfg.DNSWorkers = 1
+	}
+	if cfg.DNSQueryTimeoutMs < 250 {
+		cfg.DNSQueryTimeoutMs = 250
+	}
+	if cfg.ECSPrefix < 0 || cfg.ECSPrefix > 32 {
+		log.Fatalf("[-] -ecs-prefix must be between 0 and 32")
+	}
+	cfg.DNSResolvers = normalizeDNSResolvers(strings.Split(dnsResolversStr, ","))
+	if len(cfg.DNSResolvers) == 0 {
+		log.Fatal("[-] DNS resolver pool is empty; use -dns with IPv4 addresses")
 	}
 	cfg.Mode = Mode(modeStr)
 	cfg.CIDRs = flag.Args()
@@ -2038,12 +2427,36 @@ func main() {
 
 	var vpsQueryIP string
 
-	if cfg.Mode == ModeAuto {
-		ip, err := getPublicIP(cfg.TargetIP)
-		if err != nil {
-			log.Fatalf("[-] %v\n", err)
+	// ECS identity:
+	//   1) explicit -ecs-ip
+	//   2) -vps-ip
+	//   3) detected public IPv4
+	// The same ECS IP is used for every Stage D DNS query in this run.
+	if cfg.ECSIP != "" {
+		parsed := net.ParseIP(cfg.ECSIP)
+		if parsed == nil || parsed.To4() == nil {
+			log.Fatalf("[-] Invalid -ecs-ip: %s", cfg.ECSIP)
 		}
-		vpsQueryIP = ip
+		cfg.ECSIP = parsed.To4().String()
+	} else if cfg.TargetIP != "" {
+		parsed := net.ParseIP(cfg.TargetIP)
+		if parsed != nil && parsed.To4() != nil {
+			cfg.ECSIP = parsed.To4().String()
+		}
+	}
+	if cfg.ECSIP == "" {
+		ip, err := getPublicIP("")
+		if err != nil {
+			log.Fatalf("[-] ECS IP detection failed: %v", err)
+		}
+		cfg.ECSIP = ip
+	}
+
+	if cfg.Mode == ModeAuto {
+		vpsQueryIP = cfg.TargetIP
+		if vpsQueryIP == "" {
+			vpsQueryIP = cfg.ECSIP
+		}
 
 		if cfg.TargetASN == "" || cfg.TargetCountry == "" {
 			asn, _ := getASNAndPrefix(vpsQueryIP)
@@ -2056,6 +2469,9 @@ func main() {
 			}
 		}
 	}
+
+	fmt.Printf("[*] ECS client IP:          %s/%d\n", cfg.ECSIP, cfg.ECSPrefix)
+	fmt.Printf("[*] Raw UDP DNS pool:       %s\n", strings.Join(cfg.DNSResolvers, ", "))
 
 	var results []Candidate
 
