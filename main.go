@@ -20,6 +20,7 @@ import (
 	"os/signal"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,7 +33,9 @@ import (
 	"github.com/oschwald/geoip2-golang"
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2/hpack"
+	"golang.org/x/net/publicsuffix"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/singleflight"
 )
 
 // ================= CONFIG & CONSTANTS =================
@@ -57,10 +60,12 @@ const (
 	FlagPriority   = 0x20
 	FlagAck        = 0x01
 
-	dnsFastPoolSize = 32
-	LimitMaxIPs     = 262144
-	MaxHostsPer24   = 254
-	MaxSampled24    = 4
+	dnsFastPoolSize      = 32
+	LimitMaxIPs          = 262144
+	MaxHostsPer24        = 254
+	MaxSampled24         = 4
+	MaxDiscoveredDomains = 50000
+	LimitValidPairs      = 10000
 )
 
 var (
@@ -117,6 +122,13 @@ const (
 )
 
 func (s DomainSource) Has(flag DomainSource) bool { return s&flag != 0 }
+
+type Evidence struct {
+	Direct    DomainSource
+	Inherited DomainSource
+}
+
+func (e Evidence) Combined() DomainSource { return e.Direct | e.Inherited }
 
 // ================= MODELS =================
 
@@ -213,7 +225,7 @@ type TargetPair struct {
 	Evidence DomainSource
 }
 
-// ================= TELEMETRY =================
+// ================= TELEMETRY & CACHES =================
 
 type PipelineStats struct {
 	mu                    sync.Mutex
@@ -237,6 +249,71 @@ type PipelineStats struct {
 	EndStreamOK           int
 	ASNFiltered           int
 	CountryFiltered       int
+	IPWithPTR             int
+	IPWithDirectTLS       int
+}
+
+func NewPipelineStats() *PipelineStats {
+	return &PipelineStats{}
+}
+
+type RuntimeCaches struct {
+	DNSCache *SafeDNSCache
+	DNSGroup *singleflight.Group
+}
+
+func NewRuntimeCaches() *RuntimeCaches {
+	return &RuntimeCaches{
+		DNSCache: NewSafeDNSCache(),
+		DNSGroup: &singleflight.Group{},
+	}
+}
+
+type DNSCacheEntry struct {
+	IPs      []string
+	NXDomain bool
+	Expires  time.Time
+}
+
+type SafeDNSCache struct {
+	mu   sync.RWMutex
+	data map[string]*DNSCacheEntry
+}
+
+func NewSafeDNSCache() *SafeDNSCache {
+	return &SafeDNSCache{data: make(map[string]*DNSCacheEntry)}
+}
+
+func (c *SafeDNSCache) Get(key string) (*DNSCacheEntry, bool) {
+	c.mu.RLock()
+	v, ok := c.data[key]
+	c.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	if time.Now().After(v.Expires) {
+		c.mu.Lock()
+		if v2, ok2 := c.data[key]; ok2 && time.Now().After(v2.Expires) {
+			delete(c.data, key)
+		}
+		c.mu.Unlock()
+		return nil, false
+	}
+	var ips []string
+	if v.IPs != nil {
+		ips = append([]string(nil), v.IPs...)
+	}
+	return &DNSCacheEntry{IPs: ips, NXDomain: v.NXDomain}, true
+}
+
+func (c *SafeDNSCache) Put(key string, entry *DNSCacheEntry, ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var ips []string
+	if entry.IPs != nil {
+		ips = append([]string(nil), entry.IPs...)
+	}
+	c.data[key] = &DNSCacheEntry{IPs: ips, NXDomain: entry.NXDomain, Expires: time.Now().Add(ttl)}
 }
 
 // ================= DNSCRYPT POOL =================
@@ -757,35 +834,51 @@ func activeProbeIP(ctx context.Context, ip string, pool *DNSPool, timeout time.D
 	return results
 }
 
-func resolveIPv4DNSCrypt(ctx context.Context, pool *DNSPool, domain string) ([]string, error) {
-	req := new(mdns.Msg)
-	req.SetQuestion(mdns.Fqdn(domain), mdns.TypeA)
-	req.RecursionDesired = true
-	resp, _, _, err := pool.exchange(ctx, req)
+func resolveIPv4Cached(ctx context.Context, pool *DNSPool, domain string, rtCaches *RuntimeCaches) ([]string, error) {
+	domain = CleanDomain(domain)
+	if domain == "" {
+		return nil, fmt.Errorf("invalid domain")
+	}
+	v, err, _ := rtCaches.DNSGroup.Do(domain, func() (interface{}, error) {
+		if cached, ok := rtCaches.DNSCache.Get(domain); ok {
+			if cached.NXDomain {
+				return nil, ErrDNSNXDomain
+			}
+			return cached.IPs, nil
+		}
+		req := new(mdns.Msg)
+		req.SetQuestion(mdns.Fqdn(domain), mdns.TypeA)
+		req.RecursionDesired = true
+		resp, _, _, err := pool.exchange(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.Rcode == mdns.RcodeNameError {
+			rtCaches.DNSCache.Put(domain, &DNSCacheEntry{NXDomain: true}, 1*time.Minute)
+			return nil, ErrDNSNXDomain
+		}
+		if resp.Rcode != mdns.RcodeSuccess {
+			return nil, fmt.Errorf("DNS response code: %s", mdns.RcodeToString[resp.Rcode])
+		}
+		seen := make(map[string]struct{})
+		var ips []string
+		for _, answer := range resp.Answer {
+			if a, ok := answer.(*mdns.A); ok {
+				ip := a.A.String()
+				if _, exists := seen[ip]; !exists {
+					seen[ip] = struct{}{}
+					ips = append(ips, ip)
+				}
+			}
+		}
+		rtCaches.DNSCache.Put(domain, &DNSCacheEntry{IPs: ips}, 5*time.Minute)
+		return ips, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	if resp.Rcode == mdns.RcodeNameError {
-		return nil, ErrDNSNXDomain
-	}
-	if resp.Rcode != mdns.RcodeSuccess {
-		return nil, fmt.Errorf("DNS response code: %s", mdns.RcodeToString[resp.Rcode])
-	}
-	seen := make(map[string]struct{})
-	var ips []string
-	for _, answer := range resp.Answer {
-		if a, ok := answer.(*mdns.A); ok {
-			ip := a.A.String()
-			if _, exists := seen[ip]; !exists {
-				seen[ip] = struct{}{}
-				ips = append(ips, ip)
-			}
-		}
-	}
-	return ips, nil
+	return v.([]string), nil
 }
-
-var ErrDNSNXDomain = errors.New("NXDOMAIN")
 
 // ================= DB & IP HELPERS =================
 func ensureDB(path, dbURL string) error {
@@ -1038,25 +1131,6 @@ func reverseIPv4(ip string) (string, error) {
 }
 
 // ================= HTTP/2 PROBE =================
-const clientAdvertisedMaxFrameSize = 16384
-
-type ProbeStage int
-
-const (
-	ProbeStageTCP ProbeStage = iota
-	ProbeStageTLS
-	ProbeStageTLSValidation
-	ProbeStageH2
-	ProbeStageHeaders
-	ProbeStageComplete
-)
-
-type ProbeError struct {
-	Stage ProbeStage
-	Err   error
-}
-
-func (e *ProbeError) Error() string { return e.Err.Error() }
 
 func writeH2(conn net.Conn, b []byte, timeout time.Duration) error {
 	conn.SetWriteDeadline(time.Now().Add(timeout))
@@ -1204,6 +1278,13 @@ func parseTrailers(cand *Candidate, headers []hpack.HeaderField) error {
 	}
 	return nil
 }
+
+type ProbeError struct {
+	Stage ProbeStage
+	Err   error
+}
+
+func (e *ProbeError) Error() string { return e.Err.Error() }
 
 func ProbeH2(ctx context.Context, ip, sni string, ev DomainSource, cfg Config) (*Candidate, *ProbeError) {
 	cand := &Candidate{
@@ -1799,7 +1880,9 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 
 	for _, d := range cfg.Domains {
 		if cleaned := CleanDomain(d); cleaned != "" {
+			discoveredMu.Lock()
 			discoveredDomains[cleaned] |= SourceSeed
+			discoveredMu.Unlock()
 		}
 	}
 
