@@ -250,24 +250,23 @@ type PipelineStats struct {
 	DNSValidPairs         int
 
 	// PTR
-	PTRQueriesSent        int
-	PTRNoError            int
-	PTRNXDomain           int
-	PTREmptyAnswer        int
-	PTRErrors             int
+	PTRQueriesSent int
+	PTRNoError     int
+	PTRNXDomain    int
+	PTREmptyAnswer int
+	PTRErrors      int
 
 	// TCP
-	TCPConnected          int
-	TCPTimeouts           int
-	TCPRefused            int
-	TCPOtherErrs          int
+	TCPConnected int
+	TCPTimeouts  int
+	TCPRefused   int
+	TCPOtherErrs int
 
 	// TLS
 	TLSHandshake          int
 	TLSTimeouts           int
 	TLSValidationFailures int
 	NoPeerCertificates    int
-	// Детальная телеметрия TLS
 	TLSHandshakeFailure   int
 	TLSUnrecognizedName   int
 	TLSConnectionReset    int
@@ -275,31 +274,30 @@ type PipelineStats struct {
 	TLSOtherErrs          int
 
 	// H2
-	H2NoALPN              int
-	H2ProtocolOK          int
-	H2TimeoutNoFrames     int
-	// Детальная телеметрия H2 ошибок
-	H2ConnectionReset     int
-	H2BrokenPipe          int
-	H2BadRequest          int // Сервер плюнул HTTP/1.1 400 Bad Request
-	H2GoAway              int
-	H2EOF                 int
-	H2OtherErrs           int
+	H2NoALPN          int
+	H2ProtocolOK      int
+	H2TimeoutNoFrames int
+	H2ConnectionReset int
+	H2BrokenPipe      int
+	H2BadRequest      int
+	H2GoAway          int
+	H2EOF             int
+	H2OtherErrs       int
 
-	H2HeadersOK           int
-	H2Timeouts            int
-	H2HPACKErrors         int
+	H2HeadersOK   int
+	H2Timeouts    int
+	H2HPACKErrors int
 
-	H2StatusOK            int
-	H2InvalidStatus       int
-	EndStreamOK           int
+	H2StatusOK      int
+	H2InvalidStatus int
+	EndStreamOK     int
 
 	// Score / Final
-	ScoreRejected         int
-	CandidatesAccepted    int
+	ScoreRejected      int
+	CandidatesAccepted int
 
-	IPWithPTR             int
-	IPWithDirectTLS       int
+	IPWithPTR       int
+	IPWithDirectTLS int
 }
 
 func NewPipelineStats() *PipelineStats {
@@ -1190,7 +1188,6 @@ func activeProbeIP(ctx context.Context, ip string, pool *DNSPool, timeout time.D
 		}
 	}
 
-	// ИСПРАВЛЕНИЕ: Увеличен лимит выборки после сортировки до 25 доменов на IP для максимального охвата
 	uniqueDoms := uniqueStrings(allDoms)
 
 	sort.Slice(uniqueDoms, func(i, j int) bool {
@@ -1273,7 +1270,7 @@ func resolveIPv4Cached(ctx context.Context, pool *DNSPool, domain string, rtCach
 		}
 		ips, err := resolveIPv4DNSCrypt(ctx, pool, domain)
 		if errors.Is(err, ErrDNSNXDomain) {
-			rtCaches.DNSCache.Put(domain, &DNSCacheEntry{NXDomain: true}, 10*time.Second) // ИСПРАВЛЕНИЕ: Кэш 10 сек для разнообразия DNS ответов (Geo/Round-Robin)
+			rtCaches.DNSCache.Put(domain, &DNSCacheEntry{NXDomain: true}, 10*time.Second)
 			return nil, err
 		}
 		if err != nil {
@@ -1399,8 +1396,6 @@ func ipInRanges(ipStr string, ranges []ipRange) bool {
 }
 
 // ================= HTTP/2 PROBE =================
-const clientAdvertisedMaxFrameSize = 16384
-
 type ProbeStage int
 
 const (
@@ -1621,8 +1616,7 @@ func ProbeH2(ctx context.Context, ip, sni string, ev DomainSource, cfg Config) (
 	requestSent := time.Now()
 	uConn.SetReadDeadline(time.Now().Add(time.Duration(cfg.H2ReadTimeoutMs) * time.Millisecond))
 
-	const maxInboundFrameSize = uint32(clientAdvertisedMaxFrameSize)
-	buf := make([]byte, 32768)
+	buf := make([]byte, 8192) // Оптимизация буфера
 	recvBuf := bytes.Buffer{}
 	headerBlocks := bytes.Buffer{}
 	decoder := hpack.NewDecoder(4096, nil)
@@ -1644,7 +1638,7 @@ ReadLoop:
 		for recvBuf.Len() >= 9 {
 			data := recvBuf.Bytes()
 			length := uint32(data[0])<<16 | uint32(data[1])<<8 | uint32(data[2])
-			if length > maxInboundFrameSize {
+			if length > 16384 { // Защита от кривых фреймов
 				break ReadLoop
 			}
 			if uint32(recvBuf.Len()) < 9+length {
@@ -1755,7 +1749,6 @@ ReadLoop:
 
 							cand.Timings.H2Headers = time.Since(requestSent)
 							cand.H2HeadersReceived = true
-
 							break ReadLoop
 						} else if isTrailers {
 							parseTrailers(cand, headers)
@@ -1781,7 +1774,6 @@ ReadLoop:
 
 						cand.Timings.H2Headers = time.Since(requestSent)
 						cand.H2HeadersReceived = true
-
 						break ReadLoop
 					} else {
 						parseTrailers(cand, headers)
@@ -1882,7 +1874,13 @@ func scoreH2Profile(c *Candidate) float64 {
 }
 
 func validateAndEnrich(cand *Candidate, cfg Config, pipeStats *PipelineStats) bool {
-	if !cand.H2ProtocolConfirmed || !cand.H2HeadersReceived || cand.MissingStatus || cand.HTTPStatus <= 0 {
+	if !cand.H2ProtocolConfirmed {
+		return false
+	}
+	if !cand.H2HeadersReceived {
+		return false
+	}
+	if cand.MissingStatus || cand.HTTPStatus <= 0 {
 		return false
 	}
 
@@ -2100,97 +2098,112 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	var uniqueResolvedIPs sync.Map
 	var uniqueTargetIPs sync.Map
 
-	gD, gCtxD := errgroup.WithContext(ctx)
-	gD.SetLimit(cfg.DNSWorkers)
-	for dom, src := range discoveredDomains {
-		if cfg.Mode == ModeDirect && dom == CleanDomain(cfg.DirectSNI) {
-			continue
-		}
-		dom := dom
-		src := src
-		gD.Go(func() error {
-			if gCtxD.Err() != nil {
-				return gCtxD.Err()
-			}
-			pipeStats.mu.Lock()
-			pipeStats.DNSQueries++
-			pipeStats.mu.Unlock()
+	// ИСПРАВЛЕНИЕ: Пул воркеров для Stage D с использованием каналов для защиты от спайков
+	jobs := make(chan struct {
+		dom string
+		src DomainSource
+	}, len(discoveredDomains))
 
-			ips, err := resolveIPv4Cached(gCtxD, pool, dom, rtCaches)
+	var wg sync.WaitGroup
+	for i := 0; i < cfg.DNSWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				dom := job.dom
+				src := job.src
 
-			pipeStats.mu.Lock()
-			if err != nil {
-				if errors.Is(err, ErrDNSNXDomain) {
-					pipeStats.DNSSuccess++
-					pipeStats.DNSNXDomain++
-				} else {
-					pipeStats.DNSFailed++
-					var dnsErr *net.DNSError
-					if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
-						pipeStats.DNSTimeout++
-					} else if errors.As(err, &dnsErr) {
-						if dnsErr.Timeout() {
+				pipeStats.mu.Lock()
+				pipeStats.DNSQueries++
+				pipeStats.mu.Unlock()
+
+				ips, err := resolveIPv4Cached(ctx, pool, dom, rtCaches)
+
+				pipeStats.mu.Lock()
+				if err != nil {
+					if errors.Is(err, ErrDNSNXDomain) {
+						pipeStats.DNSSuccess++
+						pipeStats.DNSNXDomain++
+					} else {
+						pipeStats.DNSFailed++
+						var dnsErr *net.DNSError
+						if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
 							pipeStats.DNSTimeout++
-						} else if dnsErr.Temporary() {
-							pipeStats.DNSTemporary++
+						} else if errors.As(err, &dnsErr) {
+							if dnsErr.Timeout() {
+								pipeStats.DNSTimeout++
+							} else if dnsErr.Temporary() {
+								pipeStats.DNSTemporary++
+							} else {
+								pipeStats.DNSOtherErr++
+							}
 						} else {
 							pipeStats.DNSOtherErr++
 						}
-					} else {
-						pipeStats.DNSOtherErr++
 					}
-				}
-				pipeStats.mu.Unlock()
-				return nil
-			}
-
-			if len(ips) == 0 {
-				pipeStats.DNSSuccess++
-				pipeStats.DNSNoIPv4++
-				pipeStats.mu.Unlock()
-				return nil
-			}
-
-			pipeStats.DNSSuccess++
-			pipeStats.DNSResolvedIPs += len(ips)
-			pipeStats.mu.Unlock()
-
-			matched := false
-			for _, resolvedIP := range ips {
-				uniqueResolvedIPs.Store(resolvedIP, struct{}{})
-
-				if ipInRanges(resolvedIP, scanRanges) {
-					uniqueTargetIPs.Store(resolvedIP, struct{}{})
-					matched = true
-
-					pipeStats.mu.Lock()
-					pipeStats.DNSTargetRangeMatches++
 					pipeStats.mu.Unlock()
+					continue
+				}
 
-					pairKey := resolvedIP + "\x00" + dom
-					if _, loaded := pairSeen.LoadOrStore(pairKey, true); !loaded {
-						pairsMu.Lock()
-						if len(validPairs) < LimitValidPairs {
-							validPairs = append(validPairs, TargetPair{
-								IP:       resolvedIP,
-								SNI:      dom,
-								Evidence: src,
-							})
+				if len(ips) == 0 {
+					pipeStats.DNSSuccess++
+					pipeStats.DNSNoIPv4++
+					pipeStats.mu.Unlock()
+					continue
+				}
+
+				pipeStats.DNSSuccess++
+				pipeStats.DNSResolvedIPs += len(ips)
+				pipeStats.mu.Unlock()
+
+				matched := false
+				for _, resolvedIP := range ips {
+					uniqueResolvedIPs.Store(resolvedIP, struct{}{})
+
+					if ipInRanges(resolvedIP, scanRanges) {
+						uniqueTargetIPs.Store(resolvedIP, struct{}{})
+						matched = true
+
+						pipeStats.mu.Lock()
+						pipeStats.DNSTargetRangeMatches++
+						pipeStats.mu.Unlock()
+
+						pairKey := resolvedIP + "\x00" + dom
+						if _, loaded := pairSeen.LoadOrStore(pairKey, true); !loaded {
+							pairsMu.Lock()
+							if len(validPairs) < LimitValidPairs {
+								validPairs = append(validPairs, TargetPair{
+									IP:       resolvedIP,
+									SNI:      dom,
+									Evidence: src,
+								})
+							}
+							pairsMu.Unlock()
 						}
-						pairsMu.Unlock()
 					}
 				}
+				if matched {
+					pipeStats.mu.Lock()
+					pipeStats.DNSTargetDomains++
+					pipeStats.mu.Unlock()
+				}
 			}
-			if matched {
-				pipeStats.mu.Lock()
-				pipeStats.DNSTargetDomains++
-				pipeStats.mu.Unlock()
-			}
-			return nil
-		})
+		}()
 	}
 
-	if err := gD.Wait(); err != nil || ctx.Err() != nil {
+	for dom, src := range discoveredDomains {
+		jobs <- struct {
+			dom string
+			src DomainSource
+		}{dom, src}
+	}
+	close(jobs)
+	wg.Wait()
+
+	if ctx.Err() != nil {
 		fmt.Println("[-] Выполнение прервано (Stage D).")
 		return nil
 	}
@@ -2224,136 +2237,169 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	fmt.Printf("[*] STAGE E: Active HTTP/2 Scanning & TLS Enrichment (%d targets)...\n", len(validPairs))
 	var candidates []Candidate
 	var candMu sync.Mutex
-	gE, gCtxE := errgroup.WithContext(ctx)
-	gE.SetLimit(cfg.Workers)
+
+	// ИСПРАВЛЕНИЕ: Пул воркеров для Stage E для защиты от локального таймаута при 1000 горутинах
+	h2jobs := make(chan TargetPair, len(validPairs))
+	var wgE sync.WaitGroup
+	
+	// Вычисляем оптимальный таймаут (по умолчанию 3 секунды)
+	tcpTimeout := time.Duration(cfg.TCPTimeoutMs) * time.Millisecond
+	if tcpTimeout < 3000*time.Millisecond {
+		tcpTimeout = 3000 * time.Millisecond
+	}
+	cfg.TCPTimeoutMs = int(tcpTimeout.Milliseconds())
+	
+	tlsTimeout := time.Duration(cfg.TLSTimeoutMs) * time.Millisecond
+	if tlsTimeout < 3000*time.Millisecond {
+		tlsTimeout = 3000 * time.Millisecond
+	}
+	cfg.TLSTimeoutMs = int(tlsTimeout.Milliseconds())
+
+	for i := 0; i < cfg.Workers; i++ {
+		wgE.Add(1)
+		go func() {
+			defer wgE.Done()
+			for p := range h2jobs {
+				if ctx.Err() != nil {
+					return
+				}
+
+				cand, pErr := ProbeH2(ctx, p.IP, p.SNI, p.Evidence, cfg)
+
+				pipeStats.mu.Lock()
+
+				// 1. TCP
+				if pErr != nil && pErr.Stage == ProbeStageTCP {
+					errStr := pErr.Err.Error()
+					if os.IsTimeout(pErr.Err) || strings.Contains(errStr, "deadline") || strings.Contains(errStr, "i/o timeout") {
+						pipeStats.TCPTimeouts++
+					} else if strings.Contains(errStr, "refused") {
+						pipeStats.TCPRefused++
+					} else {
+						pipeStats.TCPOtherErrs++
+					}
+					pipeStats.mu.Unlock()
+					continue
+				}
+				pipeStats.TCPConnected++
+
+				// 2. TLS
+				if pErr != nil && (pErr.Stage == ProbeStageTLS || pErr.Stage == ProbeStageTLSValidation) {
+					errStr := pErr.Err.Error()
+					if os.IsTimeout(pErr.Err) || strings.Contains(errStr, "deadline") || strings.Contains(errStr, "i/o timeout") {
+						pipeStats.TLSTimeouts++
+					} else if strings.Contains(errStr, "no peer certificates") {
+						pipeStats.NoPeerCertificates++
+					} else if strings.Contains(errStr, "handshake failure") {
+						pipeStats.TLSHandshakeFailure++
+					} else if strings.Contains(errStr, "unrecognized name") {
+						pipeStats.TLSUnrecognizedName++
+					} else if strings.Contains(errStr, "connection reset") {
+						pipeStats.TLSConnectionReset++
+					} else if errors.Is(pErr.Err, io.EOF) || strings.Contains(errStr, "EOF") {
+						pipeStats.TLSEOF++
+					} else if pErr.Stage == ProbeStageTLSValidation {
+						pipeStats.TLSValidationFailures++
+					} else {
+						pipeStats.TLSOtherErrs++
+					}
+					pipeStats.mu.Unlock()
+					continue
+				}
+				pipeStats.TLSHandshake++
+
+				// 3. H2 Protocol
+				if cand != nil && cand.ALPN != "h2" {
+					pipeStats.H2NoALPN++
+				}
+
+				if pErr != nil {
+					errStr := pErr.Err.Error()
+					if os.IsTimeout(pErr.Err) || strings.Contains(errStr, "deadline") || strings.Contains(errStr, "i/o timeout") || (cand != nil && cand.ReadTimeout) {
+						pipeStats.H2TimeoutNoFrames++
+					} else if strings.Contains(errStr, "connection reset") {
+						pipeStats.H2ConnectionReset++
+					} else if strings.Contains(errStr, "broken pipe") {
+						pipeStats.H2BrokenPipe++
+					} else if strings.Contains(errStr, "400 Bad Request") || strings.Contains(errStr, "HTTP/1.1") {
+						pipeStats.H2BadRequest++
+					} else if cand != nil && cand.GoAwaySeen {
+						pipeStats.H2GoAway++
+					} else if errors.Is(pErr.Err, io.EOF) || strings.Contains(errStr, "EOF") {
+						pipeStats.H2EOF++
+					} else {
+						pipeStats.H2OtherErrs++
+					}
+					pipeStats.mu.Unlock()
+					continue
+				}
+
+				if cand == nil || !cand.H2ProtocolConfirmed {
+					pipeStats.H2OtherErrs++
+					pipeStats.mu.Unlock()
+					continue
+				}
+				pipeStats.H2ProtocolOK++
+
+				// 4. H2 Headers
+				if !cand.H2HeadersReceived {
+					if cand.ReadTimeout {
+						pipeStats.H2Timeouts++
+					} else if cand.HPACKErrors {
+						pipeStats.H2HPACKErrors++
+					} else {
+						pipeStats.H2OtherErrs++
+					}
+					pipeStats.mu.Unlock()
+					continue
+				}
+				pipeStats.H2HeadersOK++
+
+				// 5. H2 HTTP Status
+				if cand.MissingStatus || cand.HTTPStatus <= 0 {
+					pipeStats.H2InvalidStatus++
+					pipeStats.mu.Unlock()
+					continue
+				}
+				pipeStats.H2StatusOK++
+
+				if cand.EndStreamSeen {
+					pipeStats.EndStreamOK++
+				}
+				pipeStats.mu.Unlock()
+
+				// 6. Score & Enrich
+				if !validateAndEnrich(cand, cfg, pipeStats) {
+					pipeStats.mu.Lock()
+					pipeStats.ScoreRejected++
+					pipeStats.mu.Unlock()
+					continue
+				}
+
+				// 7. Success
+				pipeStats.mu.Lock()
+				pipeStats.CandidatesAccepted++
+				pipeStats.mu.Unlock()
+
+				candMu.Lock()
+				candidates = append(candidates, *cand)
+				candMu.Unlock()
+			}
+		}()
+	}
 
 	for _, p := range validPairs {
-		p := p
-		gE.Go(func() error {
-			if gCtxE.Err() != nil {
-				return gCtxE.Err()
-			}
-
-			cand, pErr := ProbeH2(gCtxE, p.IP, p.SNI, p.Evidence, cfg)
-
-			pipeStats.mu.Lock()
-			defer pipeStats.mu.Unlock()
-
-			// 1. TCP
-			if pErr != nil && pErr.Stage == ProbeStageTCP {
-				errStr := pErr.Err.Error()
-				if os.IsTimeout(pErr.Err) || strings.Contains(errStr, "deadline") || strings.Contains(errStr, "i/o timeout") {
-					pipeStats.TCPTimeouts++
-				} else if strings.Contains(errStr, "refused") {
-					pipeStats.TCPRefused++
-				} else {
-					pipeStats.TCPOtherErrs++
-				}
-				return nil
-			}
-			pipeStats.TCPConnected++
-
-			// 2. TLS
-			if pErr != nil && (pErr.Stage == ProbeStageTLS || pErr.Stage == ProbeStageTLSValidation) {
-				errStr := pErr.Err.Error()
-				if os.IsTimeout(pErr.Err) || strings.Contains(errStr, "deadline") || strings.Contains(errStr, "i/o timeout") {
-					pipeStats.TLSTimeouts++
-				} else if strings.Contains(errStr, "no peer certificates") {
-					pipeStats.NoPeerCertificates++
-				} else if strings.Contains(errStr, "handshake failure") {
-					pipeStats.TLSHandshakeFailure++
-				} else if strings.Contains(errStr, "unrecognized name") {
-					pipeStats.TLSUnrecognizedName++
-				} else if strings.Contains(errStr, "connection reset") {
-					pipeStats.TLSConnectionReset++
-				} else if errors.Is(pErr.Err, io.EOF) || strings.Contains(errStr, "EOF") {
-					pipeStats.TLSEOF++
-				} else if pErr.Stage == ProbeStageTLSValidation {
-					pipeStats.TLSValidationFailures++
-				} else {
-					pipeStats.TLSOtherErrs++
-				}
-				return nil
-			}
-			pipeStats.TLSHandshake++
-
-			// 3. H2 Protocol
-			if cand != nil && cand.ALPN != "h2" {
-				pipeStats.H2NoALPN++
-			}
-
-			if pErr != nil {
-				errStr := pErr.Err.Error()
-				if os.IsTimeout(pErr.Err) || strings.Contains(errStr, "deadline") || strings.Contains(errStr, "i/o timeout") || (cand != nil && cand.ReadTimeout) {
-					pipeStats.H2TimeoutNoFrames++
-				} else if strings.Contains(errStr, "connection reset") {
-					pipeStats.H2ConnectionReset++
-				} else if strings.Contains(errStr, "broken pipe") {
-					pipeStats.H2BrokenPipe++
-				} else if strings.Contains(errStr, "400 Bad Request") || strings.Contains(errStr, "HTTP/1.1") {
-					pipeStats.H2BadRequest++
-				} else if cand != nil && cand.GoAwaySeen {
-					pipeStats.H2GoAway++
-				} else if errors.Is(pErr.Err, io.EOF) || strings.Contains(errStr, "EOF") {
-					pipeStats.H2EOF++
-				} else {
-					pipeStats.H2OtherErrs++
-				}
-				return nil
-			}
-
-			if cand == nil || !cand.H2ProtocolConfirmed {
-				pipeStats.H2OtherErrs++
-				return nil
-			}
-			pipeStats.H2ProtocolOK++
-
-			// 4. H2 Headers
-			if !cand.H2HeadersReceived {
-				if cand.ReadTimeout {
-					pipeStats.H2Timeouts++
-				} else if cand.HPACKErrors {
-					pipeStats.H2HPACKErrors++
-				} else {
-					pipeStats.H2OtherErrs++
-				}
-				return nil
-			}
-			pipeStats.H2HeadersOK++
-
-			// 5. H2 HTTP Status
-			if cand.MissingStatus || cand.HTTPStatus <= 0 {
-				pipeStats.H2InvalidStatus++
-				return nil
-			}
-			pipeStats.H2StatusOK++
-
-			if cand.EndStreamSeen {
-				pipeStats.EndStreamOK++
-			}
-
-			// 6. Score & Enrich
-			if !validateAndEnrich(cand, cfg, pipeStats) {
-				pipeStats.ScoreRejected++
-				return nil
-			}
-
-			// 7. Success
-			pipeStats.CandidatesAccepted++
-			candMu.Lock()
-			candidates = append(candidates, *cand)
-			candMu.Unlock()
-
-			return nil
-		})
+		h2jobs <- p
 	}
-	if err := gE.Wait(); err != nil || ctx.Err() != nil {
+	close(h2jobs)
+	wgE.Wait()
+
+	if ctx.Err() != nil {
 		fmt.Println("[-] Выполнение прервано (Stage E).")
 		return nil
 	}
 
-	// ИСПРАВЛЕНИЕ: Мы больше не удаляем кандидатов ради "5 per IP".
-	// Мы выводим ВСЕХ успешных кандидатов, чтобы телеметрия сошлась с выводом байт-в-байт.
+	// ИСПРАВЛЕНИЕ: Мы выводим ВСЕХ успешных кандидатов, чтобы телеметрия сошлась с выводом байт-в-байт.
 	ipClusters := make(map[string][]Candidate)
 	for _, c := range candidates {
 		ipClusters[c.IP] = append(ipClusters[c.IP], c)
@@ -2379,13 +2425,6 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	fmt.Printf("[*] IP с сертификатами (TLS):  %d\n", s.IPWithDirectTLS)
 	fmt.Printf("[*] Найдено уник. доменов:     %d\n\n", s.UniqueDomains)
 
-	fmt.Printf("[*] Logical DNS Lookups:       %d (Успех: %d, Ошибок: %d)\n", s.DNSQueries, s.DNSSuccess, s.DNSFailed)
-	fmt.Printf("    Детали DNS успехов:        Resolved IPs: %d, NXDOMAIN: %d, NoIPv4: %d\n", s.DNSResolvedIPs, s.DNSNXDomain, s.DNSNoIPv4)
-	fmt.Printf("    Детали DNS ошибок:         Timeout: %d, Temporary: %d, Other: %d\n", s.DNSTimeout, s.DNSTemporary, s.DNSOtherErr)
-	fmt.Printf("    Детали PTR запросов:       Sent: %d, NOERROR: %d, Empty: %d, NXDOMAIN: %d, Err: %d\n", s.PTRQueriesSent, s.PTRNoError, s.PTREmptyAnswer, s.PTRNXDomain, s.PTRErrors)
-	fmt.Printf("[*] Target Range IP Matches:   %d\n", s.DNSTargetRangeMatches)
-	fmt.Printf("[*] Подтверждено DNS-пар:      %d\n\n", s.DNSValidPairs)
-
 	fmt.Printf("[*] Анализ Stage E (Строгая Воронка):\n")
 	fmt.Printf("    1. Целей на входе (DNS):       %d\n", s.DNSValidPairs)
 	fmt.Printf("    2. Успешный TCP коннект:       %d (Потери: Timeouts=%d, Refused=%d, Other=%d)\n", s.TCPConnected, s.TCPTimeouts, s.TCPRefused, s.TCPOtherErrs)
@@ -2394,7 +2433,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	fmt.Printf("    5. Получены H2 Headers:        %d (Потери: TimeoutsNoHeaders=%d, HPACK_Err=%d)\n", s.H2HeadersOK, s.H2Timeouts, s.H2HPACKErrors)
 	fmt.Printf("    6. Валидный HTTP Status:       %d (Потери: Invalid/Zero Status=%d)\n", s.H2StatusOK, s.H2InvalidStatus)
 	fmt.Printf("    7. Финальные Кандидаты:        %d (Отклонено по Score=%d)\n", s.CandidatesAccepted, s.ScoreRejected)
-	
+
 	fmt.Printf("\n    *  Инфо: H2 целей без ALPN 'h2': %d\n", s.H2NoALPN)
 	fmt.Printf("    *  Уникальных IP-кластеров:    %d\n", len(ipClusters))
 	s.mu.Unlock()
@@ -2411,11 +2450,11 @@ func main() {
 	var modeStr, domainsStr string
 
 	flag.StringVar(&modeStr, "mode", "autonomous", "autonomous | direct")
-	flag.IntVar(&cfg.Workers, "w", 30, "Worker pool size for generic tasks")
+	flag.IntVar(&cfg.Workers, "w", 1000, "Worker pool size for TLS/TCP probing")
 	flag.IntVar(&cfg.DNSWorkers, "dns-workers", 128, "Worker pool size for DNS validation")
 	flag.IntVar(&cfg.MaxIPs, "max-ips", 0, "Limit for IP sampling (0 = no hard limit, will scan all generated IPs)")
-	flag.IntVar(&cfg.TCPTimeoutMs, "tcp-timeout", 2000, "TCP timeout ms")
-	flag.IntVar(&cfg.TLSTimeoutMs, "tls-timeout", 2000, "TLS timeout ms")
+	flag.IntVar(&cfg.TCPTimeoutMs, "tcp-timeout", 3000, "TCP timeout ms")
+	flag.IntVar(&cfg.TLSTimeoutMs, "tls-timeout", 3000, "TLS timeout ms")
 	flag.IntVar(&cfg.H2ReadTimeoutMs, "h2-read", 3000, "H2 Read timeout ms")
 	flag.IntVar(&cfg.H2WriteTimeoutMs, "h2-write", 2000, "H2 Write timeout ms")
 	flag.Int64Var(&cfg.Seed, "seed", time.Now().UnixNano(), "Random seed")
