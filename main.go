@@ -13,7 +13,6 @@ import (
 	"io"
 	"log"
 	"math"
-	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -227,8 +226,12 @@ type PipelineStats struct {
 	DNSTimeout            int
 	DNSTemporary          int
 	DNSOtherErr           int
+	DNSNoIPv4             int
 	DNSResolvedIPs        int
 	DNSTargetRangeMatches int
+	DNSTargetDomains      int
+	DNSUniqueResolvedIPs  int
+	DNSUniqueTargetIPs    int
 	DNSValidPairs         int
 
 	// PTR
@@ -1926,7 +1929,6 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		ipClusters[c.IP] = append(ipClusters[c.IP], c)
 	}
 
-	// ИСПРАВЛЕНИЕ: Мы выводим ВСЕ результаты.
 	sort.Slice(candidates, func(i, j int) bool {
 		if candidates[i].Score != candidates[j].Score {
 			return candidates[i].Score > candidates[j].Score
@@ -1973,8 +1975,6 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 // ================= MAIN =================
 
 func main() {
-	uaRng = rand.New(rand.NewSource(time.Now().UnixNano()))
-
 	cfg := Config{}
 	var modeStr, domainsStr string
 
@@ -1986,7 +1986,6 @@ func main() {
 	flag.IntVar(&cfg.TLSTimeoutMs, "tls-timeout", 3000, "TLS timeout ms")
 	flag.IntVar(&cfg.H2ReadTimeoutMs, "h2-read", 3000, "H2 Read timeout ms")
 	flag.IntVar(&cfg.H2WriteTimeoutMs, "h2-write", 2000, "H2 Write timeout ms")
-	flag.Int64Var(&cfg.Seed, "seed", time.Now().UnixNano(), "Random seed")
 	flag.StringVar(&cfg.TargetCountry, "c", "", "Hard Filter: Target Country Code")
 	flag.StringVar(&cfg.TargetASN, "asn", "", "Hard Filter: Target ASN constraint (e.g., AS12345)")
 	flag.StringVar(&cfg.TargetIP, "vps-ip", "", "IP сервера для поиска сети (запуск с ПК)")
@@ -1997,12 +1996,6 @@ func main() {
 	flag.BoolVar(&cfg.NoActiveTLS, "no-tls-probe", false, "Disable direct IP TLS certificate extraction")
 
 	flag.Parse()
-
-	if cfg.Seed != 0 {
-		uaMu.Lock()
-		uaRng = rand.New(rand.NewSource(cfg.Seed))
-		uaMu.Unlock()
-	}
 
 	if cfg.Workers < 1 {
 		cfg.Workers = 1
