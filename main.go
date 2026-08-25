@@ -232,6 +232,8 @@ type PipelineStats struct {
 	IPSampled             int
 	ActiveProbes          int
 	UniqueDomains         int
+
+	// DNS
 	DNSQueries            int
 	DNSSuccess            int
 	DNSFailed             int
@@ -244,27 +246,50 @@ type PipelineStats struct {
 	DNSUniqueResolvedIPs  int
 	DNSUniqueTargetIPs    int
 	DNSTargetRangeMatches int
-	DNSTargetDomains      int // ВОССТАНОВЛЕНО
+	DNSTargetDomains      int
 	DNSValidPairs         int
+
+	// PTR
+	PTRQueriesSent        int
+	PTRNoError            int
+	PTRNXDomain           int
+	PTREmptyAnswer        int
+	PTRErrors             int
+
+	// TCP
 	TCPConnected          int
+	TCPTimeouts           int
+	TCPRefused            int
+	TCPOtherErrs          int
+
+	// TLS
 	TLSHandshake          int
-	NoPeerCertificates    int
+	TLSTimeouts           int
 	TLSValidationFailures int
+	NoPeerCertificates    int
+	TLSOtherErrs          int
+
+	// H2
+	H2NoALPN              int
 	H2ProtocolOK          int
+	H2TimeoutNoFrames     int
+	H2EOF                 int
+	H2OtherErrs           int
+
 	H2HeadersOK           int
-	EndStreamOK           int // ВОССТАНОВЛЕНО
-	H2HPACKErrors         int
 	H2Timeouts            int
+	H2HPACKErrors         int
+
+	H2StatusOK            int
 	H2InvalidStatus       int
+	EndStreamOK           int
+
+	// Score / Final
 	ScoreRejected         int
+	CandidatesAccepted    int
+
 	IPWithPTR             int
 	IPWithDirectTLS       int
-
-	PTRQueriesSent int
-	PTRNoError     int
-	PTRNXDomain    int
-	PTREmptyAnswer int
-	PTRErrors      int
 }
 
 func NewPipelineStats() *PipelineStats {
@@ -763,7 +788,7 @@ func getCountry(ip string) string {
 		return ""
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode == 200 {
 		var result struct {
 			CountryCode string `json:"countryCode"`
@@ -1069,6 +1094,7 @@ func activeProbeIP(ctx context.Context, ip string, pool *DNSPool, timeout time.D
 		sourceMap[d] |= src
 	}
 
+	// 1. DIRECT TLS
 	if !noTLS {
 		doms := extractDomainsFromTLS(ctx, ip, ip, timeout)
 		if len(doms) > 0 && len(doms) <= 15 {
@@ -1078,6 +1104,7 @@ func activeProbeIP(ctx context.Context, ip string, pool *DNSPool, timeout time.D
 		}
 	}
 
+	// 2. PTR
 	if !noPTR {
 		rev, err := reverseIPv4(ip)
 		if err == nil {
@@ -1134,6 +1161,7 @@ func activeProbeIP(ctx context.Context, ip string, pool *DNSPool, timeout time.D
 		}
 	}
 
+	// 3. OSINT
 	if len(allDoms) < 5 {
 		osints := getOSINTDomains(ip)
 		for _, osint := range osints {
@@ -1155,20 +1183,27 @@ func activeProbeIP(ctx context.Context, ip string, pool *DNSPool, timeout time.D
 		}
 	}
 
+	// 4. ДЕДУПЛИКАЦИЯ И УМНАЯ ОБРЕЗКА (Ослаблено до max 15 на IP)
 	uniqueDoms := uniqueStrings(allDoms)
-	
+
 	sort.Slice(uniqueDoms, func(i, j int) bool {
 		srcI := sourceMap[uniqueDoms[i]]
 		srcJ := sourceMap[uniqueDoms[j]]
-		
+
 		weight := func(s DomainSource) int {
 			w := 0
-			if s.Has(SourceDirectTLS) { w += 3 }
-			if s.Has(SourcePTR) { w += 2 }
-			if s.Has(SourceSeed) { w += 1 }
+			if s.Has(SourceDirectTLS) {
+				w += 3
+			}
+			if s.Has(SourcePTR) {
+				w += 2
+			}
+			if s.Has(SourceSeed) {
+				w += 1
+			}
 			return w
 		}
-		
+
 		wi, wj := weight(srcI), weight(srcJ)
 		if wi != wj {
 			return wi > wj
@@ -1714,7 +1749,7 @@ ReadLoop:
 							cand.Timings.H2Headers = time.Since(requestSent)
 							cand.H2HeadersReceived = true
 
-							break ReadLoop 
+							break ReadLoop
 						} else if isTrailers {
 							parseTrailers(cand, headers)
 						}
@@ -2153,7 +2188,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 			return nil
 		})
 	}
-	
+
 	if err := gD.Wait(); err != nil || ctx.Err() != nil {
 		fmt.Println("[-] Выполнение прервано (Stage D).")
 		return nil
@@ -2197,36 +2232,39 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 			if gCtxE.Err() != nil {
 				return gCtxE.Err()
 			}
-			
+
 			cand, pErr := ProbeH2(gCtxE, p.IP, p.SNI, p.Evidence, cfg)
 
 			pipeStats.mu.Lock()
-			defer pipeStats.mu.Unlock()
 
-			// 1. TCP 
+			// 1. TCP
 			if pErr != nil && pErr.Stage == ProbeStageTCP {
-				if os.IsTimeout(pErr.Err) || strings.Contains(pErr.Err.Error(), "deadline") {
+				errStr := pErr.Err.Error()
+				if os.IsTimeout(pErr.Err) || strings.Contains(errStr, "deadline") || strings.Contains(errStr, "i/o timeout") {
 					pipeStats.TCPTimeouts++
-				} else if strings.Contains(pErr.Err.Error(), "refused") {
+				} else if strings.Contains(errStr, "refused") {
 					pipeStats.TCPRefused++
 				} else {
 					pipeStats.TCPOtherErrs++
 				}
+				pipeStats.mu.Unlock()
 				return nil
 			}
 			pipeStats.TCPConnected++
 
 			// 2. TLS
 			if pErr != nil && (pErr.Stage == ProbeStageTLS || pErr.Stage == ProbeStageTLSValidation) {
-				if os.IsTimeout(pErr.Err) || strings.Contains(pErr.Err.Error(), "deadline") {
+				errStr := pErr.Err.Error()
+				if os.IsTimeout(pErr.Err) || strings.Contains(errStr, "deadline") || strings.Contains(errStr, "i/o timeout") {
 					pipeStats.TLSTimeouts++
-				} else if strings.Contains(pErr.Err.Error(), "no peer certificates") {
+				} else if strings.Contains(errStr, "no peer certificates") {
 					pipeStats.NoPeerCertificates++
 				} else if pErr.Stage == ProbeStageTLSValidation {
 					pipeStats.TLSValidationFailures++
 				} else {
 					pipeStats.TLSOtherErrs++
 				}
+				pipeStats.mu.Unlock()
 				return nil
 			}
 			pipeStats.TLSHandshake++
@@ -2237,18 +2275,21 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 			}
 
 			if pErr != nil {
-				if os.IsTimeout(pErr.Err) || strings.Contains(pErr.Err.Error(), "deadline") || (cand != nil && cand.ReadTimeout) {
+				errStr := pErr.Err.Error()
+				if os.IsTimeout(pErr.Err) || strings.Contains(errStr, "deadline") || strings.Contains(errStr, "i/o timeout") || (cand != nil && cand.ReadTimeout) {
 					pipeStats.H2TimeoutNoFrames++
-				} else if errors.Is(pErr.Err, io.EOF) || strings.Contains(pErr.Err.Error(), "EOF") || strings.Contains(pErr.Err.Error(), "connection reset") {
+				} else if errors.Is(pErr.Err, io.EOF) || strings.Contains(errStr, "EOF") || strings.Contains(errStr, "connection reset") || strings.Contains(errStr, "broken pipe") {
 					pipeStats.H2EOF++
 				} else {
 					pipeStats.H2OtherErrs++
 				}
+				pipeStats.mu.Unlock()
 				return nil
 			}
 
 			if cand == nil || !cand.H2ProtocolConfirmed {
 				pipeStats.H2OtherErrs++
+				pipeStats.mu.Unlock()
 				return nil
 			}
 			pipeStats.H2ProtocolOK++
@@ -2256,12 +2297,13 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 			// 4. H2 Headers
 			if !cand.H2HeadersReceived {
 				if cand.ReadTimeout {
-					pipeStats.H2Timeouts++ 
+					pipeStats.H2Timeouts++
 				} else if cand.HPACKErrors {
 					pipeStats.H2HPACKErrors++
 				} else {
 					pipeStats.H2OtherErrs++
 				}
+				pipeStats.mu.Unlock()
 				return nil
 			}
 			pipeStats.H2HeadersOK++
@@ -2269,6 +2311,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 			// 5. H2 HTTP Status
 			if cand.MissingStatus || cand.HTTPStatus <= 0 {
 				pipeStats.H2InvalidStatus++
+				pipeStats.mu.Unlock()
 				return nil
 			}
 			pipeStats.H2StatusOK++
@@ -2276,19 +2319,25 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 			if cand.EndStreamSeen {
 				pipeStats.EndStreamOK++
 			}
+			pipeStats.mu.Unlock()
 
 			// 6. Score & Enrich
 			if !validateAndEnrich(cand, cfg, pipeStats) {
+				pipeStats.mu.Lock()
 				pipeStats.ScoreRejected++
+				pipeStats.mu.Unlock()
 				return nil
 			}
 
 			// 7. Success
+			pipeStats.mu.Lock()
 			pipeStats.CandidatesAccepted++
+			pipeStats.mu.Unlock()
+
 			candMu.Lock()
 			candidates = append(candidates, *cand)
 			candMu.Unlock()
-			
+
 			return nil
 		})
 	}
@@ -2352,7 +2401,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	fmt.Printf("    - Получены H2 Headers:         %d (Timeouts/NoHeaders: %d, HPACK Errors: %d)\n", s.H2HeadersOK, s.H2Timeouts, s.H2HPACKErrors)
 	fmt.Printf("    - Валидный HTTP Status:        %d (Missing/Zero Status: %d)\n", s.H2StatusOK, s.H2InvalidStatus)
 	fmt.Printf("    - Принято кандидатов:          %d (Отклонено по Score: %d)\n\n", s.CandidatesAccepted, s.ScoreRejected)
-	
+
 	fmt.Printf("[*] Уникальных IP-кластеров:   %d\n", len(ipClusters))
 	fmt.Printf("[*] Кандидатов в выводе:       %d\n", len(clusteredCandidates))
 	s.mu.Unlock()
@@ -2476,7 +2525,7 @@ func main() {
 		var targetPrefixes []string
 		if cfg.TargetCountry != "" && cfg.TargetCountry != "UNKNOWN" {
 			targetPrefixes = filterPrefixesByCountry(allPrefixes, cfg.TargetCountry)
-			
+
 			vpsIPObj := net.ParseIP(vpsQueryIP)
 			foundLocal := false
 			var localPrefix string
@@ -2487,7 +2536,7 @@ func main() {
 					break
 				}
 			}
-			
+
 			for _, p := range targetPrefixes {
 				if p == localPrefix {
 					foundLocal = true
@@ -2502,8 +2551,7 @@ func main() {
 		}
 
 		sampledIPs := generateIPs(targetPrefixes, cfg.MaxIPs)
-		
-		// Намеренно используем все префиксы ASN для DNS валидации для расширения поиска REALITY кандидатов
+
 		dnsRanges := MergeCIDRs(allPrefixes)
 
 		fmt.Printf("[*] Целевой IP:             %s\n", vpsQueryIP)
