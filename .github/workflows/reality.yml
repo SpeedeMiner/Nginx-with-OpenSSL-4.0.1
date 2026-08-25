@@ -26,7 +26,6 @@ jobs:
         go get github.com/ameshkov/dnscrypt/v2
         go get github.com/ameshkov/dnsstamps
         go get github.com/miekg/dns
-        go get github.com/oschwald/geoip2-golang
         
         go mod tidy
         
