@@ -20,7 +20,6 @@ import (
 	"os/signal"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,7 +34,6 @@ import (
 	"golang.org/x/net/http2/hpack"
 	"golang.org/x/net/publicsuffix"
 	"golang.org/x/sync/errgroup"
-	"golang.org/x/sync/singleflight"
 )
 
 // ================= CONFIG & CONSTANTS =================
@@ -263,13 +261,11 @@ func NewPipelineStats() *PipelineStats {
 
 type RuntimeCaches struct {
 	DNSCache *SafeDNSCache
-	DNSGroup *singleflight.Group
 }
 
 func NewRuntimeCaches() *RuntimeCaches {
 	return &RuntimeCaches{
 		DNSCache: NewSafeDNSCache(),
-		DNSGroup: &singleflight.Group{},
 	}
 }
 
@@ -726,18 +722,6 @@ func CleanDomain(d string) string {
 	return d
 }
 
-func GetRootDomain(domain string) string {
-	domain = CleanDomain(domain)
-	if domain == "" {
-		return ""
-	}
-	root, err := publicsuffix.EffectiveTLDPlusOne(domain)
-	if err != nil {
-		return ""
-	}
-	return root
-}
-
 func uniqueStrings(values []string) []string {
 	seen := make(map[string]bool)
 	var result []string
@@ -831,7 +815,7 @@ func activeProbeIP(ctx context.Context, ip string, pool *DNSPool, timeout time.D
 					if ptr, ok := ans.(*mdns.PTR); ok {
 						if d := CleanDomain(ptr.Ptr); d != "" {
 							results[d] |= SourcePTR
-							
+
 							// Fallback TLS using PTR as SNI
 							if !noTLS {
 								cDoms := extractDomainsFromTLS(ctx, ip, d, timeout)
@@ -848,35 +832,6 @@ func activeProbeIP(ctx context.Context, ip string, pool *DNSPool, timeout time.D
 		}
 	}
 	return results
-}
-
-func resolvePTRDNSCrypt(ctx context.Context, pool *DNSPool, ip string) ([]string, error) {
-	rev, err := reverseIPv4(ip)
-	if err != nil {
-		return nil, err
-	}
-	req := new(mdns.Msg)
-	req.SetQuestion(rev, mdns.TypePTR)
-	req.RecursionDesired = true
-	resp, _, _, err := pool.exchange(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	if resp.Rcode == mdns.RcodeNameError {
-		return nil, ErrDNSNXDomain
-	}
-	if resp.Rcode != mdns.RcodeSuccess {
-		return nil, fmt.Errorf("DNS response code: %s", mdns.RcodeToString[resp.Rcode])
-	}
-	var names []string
-	for _, ans := range resp.Answer {
-		if ptr, ok := ans.(*mdns.PTR); ok {
-			if d := CleanDomain(ptr.Ptr); d != "" {
-				names = append(names, d)
-			}
-		}
-	}
-	return names, nil
 }
 
 func resolveIPv4DNSCrypt(ctx context.Context, pool *DNSPool, domain string) ([]string, error) {
@@ -905,52 +860,6 @@ func resolveIPv4DNSCrypt(ctx context.Context, pool *DNSPool, domain string) ([]s
 		}
 	}
 	return ips, nil
-}
-
-func resolveIPv4Cached(ctx context.Context, pool *DNSPool, domain string, rtCaches *RuntimeCaches) ([]string, error) {
-	domain = CleanDomain(domain)
-	if domain == "" {
-		return nil, fmt.Errorf("invalid domain")
-	}
-	v, err, _ := rtCaches.DNSGroup.Do(domain, func() (interface{}, error) {
-		if cached, ok := rtCaches.DNSCache.Get(domain); ok {
-			if cached.NXDomain {
-				return nil, ErrDNSNXDomain
-			}
-			return cached.IPs, nil
-		}
-		req := new(mdns.Msg)
-		req.SetQuestion(mdns.Fqdn(domain), mdns.TypeA)
-		req.RecursionDesired = true
-		resp, _, _, err := pool.exchange(ctx, req)
-		if err != nil {
-			return nil, err
-		}
-		if resp.Rcode == mdns.RcodeNameError {
-			rtCaches.DNSCache.Put(domain, &DNSCacheEntry{NXDomain: true}, 1*time.Minute)
-			return nil, ErrDNSNXDomain
-		}
-		if resp.Rcode != mdns.RcodeSuccess {
-			return nil, fmt.Errorf("DNS response code: %s", mdns.RcodeToString[resp.Rcode])
-		}
-		seen := make(map[string]struct{})
-		var ips []string
-		for _, answer := range resp.Answer {
-			if a, ok := answer.(*mdns.A); ok {
-				ip := a.A.String()
-				if _, exists := seen[ip]; !exists {
-					seen[ip] = struct{}{}
-					ips = append(ips, ip)
-				}
-			}
-		}
-		rtCaches.DNSCache.Put(domain, &DNSCacheEntry{IPs: ips}, 5*time.Minute)
-		return ips, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return v.([]string), nil
 }
 
 // ================= DB & IP HELPERS =================
@@ -1191,19 +1100,26 @@ func ipInRanges(ipStr string, ranges []ipRange) bool {
 	return false
 }
 
-func reverseIPv4(ip string) (string, error) {
-	parsed := net.ParseIP(ip)
-	if parsed == nil {
-		return "", fmt.Errorf("invalid IP")
-	}
-	parsed = parsed.To4()
-	if parsed == nil {
-		return "", fmt.Errorf("not IPv4")
-	}
-	return fmt.Sprintf("%d.%d.%d.%d.in-addr.arpa.", parsed[3], parsed[2], parsed[1], parsed[0]), nil
+// ================= HTTP/2 PROBE =================
+const clientAdvertisedMaxFrameSize = 16384
+
+type ProbeStage int
+
+const (
+	ProbeStageTCP ProbeStage = iota
+	ProbeStageTLS
+	ProbeStageTLSValidation
+	ProbeStageH2
+	ProbeStageHeaders
+	ProbeStageComplete
+)
+
+type ProbeError struct {
+	Stage ProbeStage
+	Err   error
 }
 
-// ================= HTTP/2 PROBE =================
+func (e *ProbeError) Error() string { return e.Err.Error() }
 
 func writeH2(conn net.Conn, b []byte, timeout time.Duration) error {
 	conn.SetWriteDeadline(time.Now().Add(timeout))
@@ -2000,7 +1916,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 			pipeStats.DNSQueries++
 			pipeStats.mu.Unlock()
 
-			ips, err := resolveIPv4DNSCrypt(gCtxD, pool, dom)
+			ips, err := resolveIPv4Cached(gCtxD, pool, dom, rtCaches)
 
 			pipeStats.mu.Lock()
 			if err != nil {
