@@ -58,7 +58,7 @@ const (
 	FlagPriority   = 0x20
 	FlagAck        = 0x01
 
-	dnsFastPoolSize = 128 // ИСПРАВЛЕНИЕ: Увеличен пул используемых быстрых резолверов
+	dnsFastPoolSize = 128
 
 	LimitMaxIPs          = 262144
 	MaxDiscoveredDomains = 50000
@@ -92,7 +92,7 @@ var (
 type Config struct {
 	Mode             Mode
 	Workers          int
-	DNSWorkers       int // ИСПРАВЛЕНИЕ: Раздельный лимит для DNS-воркеров
+	DNSWorkers       int
 	MaxIPs           int
 	TCPTimeoutMs     int
 	TLSTimeoutMs     int
@@ -381,6 +381,7 @@ type DNSPool struct {
 	Retries        atomic.Uint64
 	rngMu          sync.Mutex
 	rng            *rand.Rand
+	sem            chan struct{} // Семафор для защиты от шторма UDP-сокетов
 }
 
 type StampCache struct {
@@ -477,6 +478,7 @@ func checkDNSResolver(ctx context.Context, stamp string) (*DNSResolver, error) {
 	var totalRTT time.Duration
 	for _, t := range tests {
 		req := new(mdns.Msg)
+		req.Id = mdns.Id()
 		req.SetQuestion(t.Name, t.Type)
 		req.RecursionDesired = true
 		qStart := time.Now()
@@ -489,8 +491,11 @@ func checkDNSResolver(ctx context.Context, stamp string) (*DNSResolver, error) {
 	return &DNSResolver{Stamp: stamp, Info: info, RTT: totalRTT / 2}, nil
 }
 
-func buildDNSPool(ctx context.Context, stamps []string) *DNSPool {
-	pool := &DNSPool{rng: rand.New(rand.NewSource(time.Now().UnixNano()))}
+func buildDNSPool(ctx context.Context, stamps []string, dnsWorkers int) *DNSPool {
+	pool := &DNSPool{
+		rng: rand.New(rand.NewSource(time.Now().UnixNano())),
+		sem: make(chan struct{}, dnsWorkers), // ИСПРАВЛЕНИЕ: Семафор для защиты пула
+	}
 	pool.Discovered.Store(uint64(len(stamps)))
 
 	var mu sync.Mutex
@@ -529,8 +534,6 @@ func max64(a, b int64) int64 {
 
 func (p *DNSPool) pickWeighted() *DNSResolver {
 	p.mu.RLock()
-	defer p.mu.RUnlock()
-
 	var available []*DNSResolver
 	now := time.Now()
 	for _, r := range p.resolvers {
@@ -541,10 +544,21 @@ func (p *DNSPool) pickWeighted() *DNSResolver {
 			available = append(available, r)
 		}
 	}
+	p.mu.RUnlock()
 
+	// ИСПРАВЛЕНИЕ: Self-healing. Если все упали, мгновенно оживляем весь пул
 	if len(available) == 0 {
-		return nil
+		p.mu.Lock()
+		for _, r := range p.resolvers {
+			r.mu.Lock()
+			r.DisabledTo = time.Time{}
+			r.ConsecutiveFailure.Store(0)
+			r.mu.Unlock()
+			available = append(available, r)
+		}
+		p.mu.Unlock()
 	}
+
 	n := len(available)
 	if n > dnsFastPoolSize {
 		n = dnsFastPoolSize
@@ -608,6 +622,10 @@ func (p *DNSPool) resolverFailure(r *DNSResolver) uint64 {
 }
 
 func (p *DNSPool) exchange(ctx context.Context, req *mdns.Msg) (*mdns.Msg, *DNSResolver, time.Duration, error) {
+	// ИСПРАВЛЕНИЕ: Ждем свободного слота (защита от локального UDP шторма)
+	p.sem <- struct{}{}
+	defer func() { <-p.sem }()
+
 	p.LogicalQueries.Add(1)
 	var lastErr error
 
@@ -627,6 +645,7 @@ func (p *DNSPool) exchange(ctx context.Context, req *mdns.Msg) (*mdns.Msg, *DNSR
 
 		client := &dnscrypt.Client{Net: "udp", Timeout: 2500 * time.Millisecond}
 		info := resolver.getInfo()
+		req.Id = mdns.Id() // Явно генерируем ID для каждого ретрая
 
 		type exRes struct {
 			resp *mdns.Msg
@@ -651,6 +670,11 @@ func (p *DNSPool) exchange(ctx context.Context, req *mdns.Msg) (*mdns.Msg, *DNSR
 		elapsed := time.Since(start)
 
 		if err != nil {
+			// ИСПРАВЛЕНИЕ: Не штрафуем резолверы за локальную отмену контекста
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, nil, 0, err
+			}
+
 			failures := p.resolverFailure(resolver)
 			if failures == 2 {
 				if refreshErr := resolver.refresh(); refreshErr == nil {
@@ -832,7 +856,7 @@ func getPrefixes(asn string) []string {
 	json.NewDecoder(resp.Body).Decode(&result)
 	var prefixes []string
 	for _, p := range result.Data.Prefixes {
-		if !strings.Contains(p.Prefix, ":") { // Только IPv4
+		if !strings.Contains(p.Prefix, ":") {
 			prefixes = append(prefixes, p.Prefix)
 		}
 	}
@@ -1058,6 +1082,7 @@ func activeProbeIP(ctx context.Context, ip string, pool *DNSPool, timeout time.D
 		rev, err := reverseIPv4(ip)
 		if err == nil {
 			req := new(mdns.Msg)
+			req.Id = mdns.Id()
 			req.SetQuestion(rev, mdns.TypePTR)
 			req.RecursionDesired = true
 
@@ -1167,6 +1192,7 @@ func activeProbeIP(ctx context.Context, ip string, pool *DNSPool, timeout time.D
 
 func resolveIPv4DNSCrypt(ctx context.Context, pool *DNSPool, domain string) ([]string, error) {
 	req := new(mdns.Msg)
+	req.Id = mdns.Id()
 	req.SetQuestion(mdns.Fqdn(domain), mdns.TypeA)
 	req.RecursionDesired = true
 	resp, _, _, err := pool.exchange(ctx, req)
@@ -2372,7 +2398,7 @@ func main() {
 		log.Fatalf("[-] DNSCrypt list: %v", err)
 	}
 
-	dnsPool := buildDNSPool(dnsCtx, stamps)
+	dnsPool := buildDNSPool(dnsCtx, stamps, cfg.DNSWorkers)
 	dnsPool.mu.RLock()
 	poolSize := len(dnsPool.resolvers)
 	dnsPool.mu.RUnlock()
@@ -2441,7 +2467,6 @@ func main() {
 
 		sampledIPs := generateIPs(targetPrefixes, cfg.MaxIPs)
 		
-		// Намеренно используем все префиксы ASN для DNS валидации для расширения поиска REALITY кандидатов
 		dnsRanges := MergeCIDRs(allPrefixes)
 
 		fmt.Printf("[*] Целевой IP:             %s\n", vpsQueryIP)
