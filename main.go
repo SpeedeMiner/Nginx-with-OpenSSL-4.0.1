@@ -878,7 +878,7 @@ func activeProbeIP(ctx context.Context, ip string, pool *DNSPool, timeout time.D
 					for _, cd := range cDoms {
 						results[cd] |= SourceDirectTLS
 					}
-					break // Поведение старого сканера: останавливаемся после первого успешного TLS
+					break
 				}
 			}
 		}
@@ -1884,7 +1884,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	discoveredDomains := make(map[string]DomainSource)
 	var discoveredMu sync.Mutex
 
-	fmt.Printf("[*] STAGE A: Active Discovery (PTR & Direct TLS)...\n")
+	fmt.Printf("[*] STAGE A: Active Discovery (PTR & Direct TLS & OSINT)...\n")
 	gA, gCtxA := errgroup.WithContext(ctx)
 	gA.SetLimit(cfg.Workers)
 
@@ -2175,9 +2175,18 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 			}
 			return cluster[i].SNI < cluster[j].SNI
 		})
-		clusteredCandidates = append(clusteredCandidates, cluster[0])
+		
+		// Изменение лимита: выводим до 5 доменов для одного IP (как было в старой версии сканера)
+		limit := len(cluster)
+		if limit > 5 {
+			limit = 5
+		}
+		for i := 0; i < limit; i++ {
+			clusteredCandidates = append(clusteredCandidates, cluster[i])
+		}
 	}
 
+	// Глобальная сортировка перед выводом
 	sort.Slice(clusteredCandidates, func(i, j int) bool {
 		if clusteredCandidates[i].Score != clusteredCandidates[j].Score {
 			return clusteredCandidates[i].Score > clusteredCandidates[j].Score
@@ -2207,7 +2216,8 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	fmt.Printf("[*] Успешных TCP соединений:   %d\n", s.TCPConnected)
 	fmt.Printf("[*] Успешных TLS хэндшейков:   %d\n", s.TLSHandshake)
 	fmt.Printf("[*] С откликом H2 Headers:     %d\n", s.H2HeadersOK)
-	fmt.Printf("[*] Финальных IP-кластеров:    %d\n", len(clusteredCandidates))
+	fmt.Printf("[*] Уникальных IP-кластеров:   %d\n", len(ipClusters))
+	fmt.Printf("[*] Кандидатов в выводе:       %d\n", len(clusteredCandidates))
 	s.mu.Unlock()
 
 	return clusteredCandidates
