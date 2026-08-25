@@ -232,8 +232,6 @@ type PipelineStats struct {
 	IPSampled             int
 	ActiveProbes          int
 	UniqueDomains         int
-	
-	// DNS
 	DNSQueries            int
 	DNSSuccess            int
 	DNSFailed             int
@@ -246,46 +244,27 @@ type PipelineStats struct {
 	DNSUniqueResolvedIPs  int
 	DNSUniqueTargetIPs    int
 	DNSTargetRangeMatches int
+	DNSTargetDomains      int // ВОССТАНОВЛЕНО
 	DNSValidPairs         int
+	TCPConnected          int
+	TLSHandshake          int
+	NoPeerCertificates    int
+	TLSValidationFailures int
+	H2ProtocolOK          int
+	H2HeadersOK           int
+	EndStreamOK           int // ВОССТАНОВЛЕНО
+	H2HPACKErrors         int
+	H2Timeouts            int
+	H2InvalidStatus       int
+	ScoreRejected         int
+	IPWithPTR             int
+	IPWithDirectTLS       int
 
-	// PTR
 	PTRQueriesSent int
 	PTRNoError     int
 	PTRNXDomain    int
 	PTREmptyAnswer int
 	PTRErrors      int
-
-	// TCP
-	TCPConnected          int
-	TCPTimeouts           int
-	TCPRefused            int
-	TCPOtherErrs          int
-
-	// TLS
-	TLSHandshake          int
-	TLSTimeouts           int
-	TLSOtherErrs          int
-	TLSValidationFailures int
-	NoPeerCertificates    int
-
-	// H2
-	H2NoALPN              int
-	H2TimeoutNoFrames     int
-	H2EOF                 int
-	H2OtherErrs           int
-	H2ProtocolOK          int
-	H2HeadersOK           int
-	H2Timeouts            int
-	H2HPACKErrors         int
-	H2InvalidStatus       int
-	H2StatusOK            int
-
-	// Final
-	ScoreRejected         int
-	CandidatesAccepted    int
-	
-	IPWithPTR             int
-	IPWithDirectTLS       int
 }
 
 func NewPipelineStats() *PipelineStats {
@@ -879,7 +858,7 @@ func getPrefixes(asn string) []string {
 	json.NewDecoder(resp.Body).Decode(&result)
 	var prefixes []string
 	for _, p := range result.Data.Prefixes {
-		if !strings.Contains(p.Prefix, ":") { // Только IPv4
+		if !strings.Contains(p.Prefix, ":") {
 			prefixes = append(prefixes, p.Prefix)
 		}
 	}
@@ -1090,7 +1069,6 @@ func activeProbeIP(ctx context.Context, ip string, pool *DNSPool, timeout time.D
 		sourceMap[d] |= src
 	}
 
-	// 1. DIRECT TLS
 	if !noTLS {
 		doms := extractDomainsFromTLS(ctx, ip, ip, timeout)
 		if len(doms) > 0 && len(doms) <= 15 {
@@ -1100,7 +1078,6 @@ func activeProbeIP(ctx context.Context, ip string, pool *DNSPool, timeout time.D
 		}
 	}
 
-	// 2. PTR
 	if !noPTR {
 		rev, err := reverseIPv4(ip)
 		if err == nil {
@@ -1157,7 +1134,6 @@ func activeProbeIP(ctx context.Context, ip string, pool *DNSPool, timeout time.D
 		}
 	}
 
-	// 3. OSINT
 	if len(allDoms) < 5 {
 		osints := getOSINTDomains(ip)
 		for _, osint := range osints {
@@ -1179,7 +1155,6 @@ func activeProbeIP(ctx context.Context, ip string, pool *DNSPool, timeout time.D
 		}
 	}
 
-	// 4. ДЕДУПЛИКАЦИЯ И УМНАЯ ОБРЕЗКА (Ослаблено до max 15 на IP)
 	uniqueDoms := uniqueStrings(allDoms)
 	
 	sort.Slice(uniqueDoms, func(i, j int) bool {
@@ -1513,7 +1488,7 @@ func ProbeH2(ctx context.Context, ip, sni string, ev DomainSource, cfg Config) (
 		Evidence:      ev,
 		DomainQuality: classifyDomainQuality(sni),
 		CDNStatus:     CDNStatusUnknown,
-		HTTPStatus:    0, // ИСПРАВЛЕНИЕ: Ждем реального статуса
+		HTTPStatus:    0,
 	}
 
 	t0 := time.Now()
@@ -1865,7 +1840,6 @@ func scoreH2Profile(c *Candidate) float64 {
 }
 
 func validateAndEnrich(cand *Candidate, cfg Config, pipeStats *PipelineStats) bool {
-	// ИСПРАВЛЕНИЕ: Жесткая проверка: должен быть распарсен H2 Headers и валидный HTTP Status > 0.
 	if !cand.H2ProtocolConfirmed {
 		return false
 	}
@@ -1980,6 +1954,13 @@ func validateAndEnrich(cand *Candidate, cfg Config, pipeStats *PipelineStats) bo
 	cand.Score = rs.Total - scorePenalty
 
 	return true
+}
+
+func limitStr(s string, limit int) string {
+	if len(s) > limit {
+		return s[:limit]
+	}
+	return s
 }
 
 func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRanges []ipRange, pool *DNSPool) []Candidate {
@@ -2275,7 +2256,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 			// 4. H2 Headers
 			if !cand.H2HeadersReceived {
 				if cand.ReadTimeout {
-					pipeStats.H2Timeouts++ // Таймаут во время ожидания заголовков
+					pipeStats.H2Timeouts++ 
 				} else if cand.HPACKErrors {
 					pipeStats.H2HPACKErrors++
 				} else {
@@ -2522,6 +2503,7 @@ func main() {
 
 		sampledIPs := generateIPs(targetPrefixes, cfg.MaxIPs)
 		
+		// Намеренно используем все префиксы ASN для DNS валидации для расширения поиска REALITY кандидатов
 		dnsRanges := MergeCIDRs(allPrefixes)
 
 		fmt.Printf("[*] Целевой IP:             %s\n", vpsQueryIP)
