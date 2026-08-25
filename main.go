@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -25,7 +26,6 @@ import (
 	"syscall"
 	"time"
 
-	mdns "github.com/miekg/dns"
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2/hpack"
 	"golang.org/x/sync/errgroup"
@@ -73,7 +73,12 @@ var (
 	dynDNS   = []string{"duckdns.org", "mooo.com", "ddns.net", "freeddns.org", "crabdance.com", "eu.org", "cloudns.cc", "hopto.org", "zapto.org", "sytes.net", "dyn.com", "no-ip.org"}
 
 	domainRe = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$`)
+	numRe    = regexp.MustCompile(`(?i)(^|\.)\d+\.[a-z]{2,}$`)
+
 	ErrDNSNXDomain = errors.New("NXDOMAIN")
+
+	uaRng *rand.Rand
+	uaMu  sync.Mutex
 )
 
 type Config struct {
@@ -85,6 +90,7 @@ type Config struct {
 	TLSTimeoutMs     int
 	H2ReadTimeoutMs  int
 	H2WriteTimeoutMs int
+	Seed             int64
 	TargetASN        string
 	TargetCountry    string
 	TargetIP         string
@@ -106,6 +112,13 @@ const (
 )
 
 func (s DomainSource) Has(flag DomainSource) bool { return s&flag != 0 }
+
+type Evidence struct {
+	Direct    DomainSource
+	Inherited DomainSource
+}
+
+func (e Evidence) Combined() DomainSource { return e.Direct | e.Inherited }
 
 // ================= MODELS =================
 
@@ -220,8 +233,12 @@ type PipelineStats struct {
 	DNSTimeout            int
 	DNSTemporary          int
 	DNSOtherErr           int
+	DNSNoIPv4             int
 	DNSResolvedIPs        int
+	DNSUniqueResolvedIPs  int
+	DNSUniqueTargetIPs    int
 	DNSTargetRangeMatches int
+	DNSTargetDomains      int
 	DNSValidPairs         int
 
 	// PTR
@@ -335,117 +352,6 @@ func (c *SafeDNSCache) Put(key string, entry *DNSCacheEntry, ttl time.Duration) 
 		ips = append([]string(nil), entry.IPs...)
 	}
 	c.data[key] = &DNSCacheEntry{IPs: ips, NXDomain: entry.NXDomain, Expires: time.Now().Add(ttl)}
-}
-
-// ================= ECS DNS RESOLVER =================
-
-var ecsResolvers = []string{
-	"8.8.8.8:53",
-	"8.8.4.4:53",
-	"208.67.222.222:53",
-	"208.67.220.220:53",
-}
-
-func resolveHostECS(ctx context.Context, domain, vpsIP string, rtCaches *RuntimeCaches) ([]string, error) {
-	domain = CleanDomain(domain)
-	if domain == "" {
-		return nil, fmt.Errorf("invalid domain")
-	}
-
-	v, err, _ := rtCaches.DNSGroup.Do(domain, func() (interface{}, error) {
-		if cached, ok := rtCaches.DNSCache.Get(domain); ok {
-			if cached.NXDomain {
-				return nil, ErrDNSNXDomain
-			}
-			return cached.IPs, nil
-		}
-
-		req := new(mdns.Msg)
-		req.Id = mdns.Id()
-		req.SetQuestion(mdns.Fqdn(domain), mdns.TypeA)
-		req.RecursionDesired = true
-
-		if vpsIP != "" {
-			ip := net.ParseIP(vpsIP).To4()
-			if ip != nil {
-				opt := new(mdns.OPT)
-				opt.Hdr.Name = "."
-				opt.Hdr.Rrtype = mdns.TypeOPT
-				e := new(mdns.EDNS0_SUBNET)
-				e.Code = mdns.EDNS0SUBNET
-				e.Family = 1
-				e.SourceNetmask = 24
-				e.SourceScope = 0
-				e.Address = ip
-				opt.Option = append(opt.Option, e)
-				req.Extra = append(req.Extra, opt)
-			}
-		}
-
-		var lastErr error
-		client := &mdns.Client{Net: "udp", Timeout: 2 * time.Second}
-		startIdx := rand.Intn(len(ecsResolvers))
-
-		for i := 0; i < 3; i++ {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-
-			resAddr := ecsResolvers[(startIdx+i)%len(ecsResolvers)]
-
-			type res struct {
-				r *mdns.Msg
-				e error
-			}
-			ch := make(chan res, 1)
-			go func() {
-				resp, _, err := client.Exchange(req, resAddr)
-				ch <- res{resp, err}
-			}()
-
-			var resp *mdns.Msg
-			var errEx error
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case r := <-ch:
-				resp, errEx = r.r, r.e
-			}
-
-			if errEx != nil {
-				lastErr = errEx
-				continue
-			}
-			if resp.Rcode == mdns.RcodeNameError {
-				rtCaches.DNSCache.Put(domain, &DNSCacheEntry{NXDomain: true}, 10*time.Second)
-				return nil, ErrDNSNXDomain
-			}
-			if resp.Rcode != mdns.RcodeSuccess {
-				lastErr = fmt.Errorf("rcode: %d", resp.Rcode)
-				continue
-			}
-
-			seen := make(map[string]struct{})
-			var ips []string
-			for _, ans := range resp.Answer {
-				if a, ok := ans.(*mdns.A); ok {
-					ipStr := a.A.String()
-					if _, exists := seen[ipStr]; !exists {
-						seen[ipStr] = struct{}{}
-						ips = append(ips, ipStr)
-					}
-				}
-			}
-			rtCaches.DNSCache.Put(domain, &DNSCacheEntry{IPs: ips}, 10*time.Second)
-			return ips, nil
-		}
-		return nil, lastErr
-	})
-
-	if err != nil {
-		return nil, err
-	}
-	return v.([]string), nil
 }
 
 // ================= API HELPERS (RIPE & IP-API) =================
@@ -804,6 +710,7 @@ func activeProbeIP(ctx context.Context, ip string, timeout time.Duration, noPTR 
 				addDomain(d, SourceDirectTLS)
 			}
 			
+			// Ранний выход как в старой версии
 			if len(doms) <= 15 {
 				for d, src := range sourceMap {
 					pairs = append(pairs, TargetPair{IP: ip, SNI: d, Evidence: src})
@@ -892,6 +799,45 @@ func activeProbeIP(ctx context.Context, ip string, timeout time.Duration, noPTR 
 	}
 
 	return pairs
+}
+
+func resolveHostCached(ctx context.Context, domain string, rtCaches *RuntimeCaches) ([]string, error) {
+	domain = CleanDomain(domain)
+	if domain == "" {
+		return nil, fmt.Errorf("invalid domain")
+	}
+	v, err, _ := rtCaches.DNSGroup.Do(domain, func() (interface{}, error) {
+		if cached, ok := rtCaches.DNSCache.Get(domain); ok {
+			if cached.NXDomain {
+				return nil, ErrDNSNXDomain
+			}
+			return cached.IPs, nil
+		}
+		
+		ips, err := net.LookupHost(domain)
+		if err != nil {
+			var dnsErr *net.DNSError
+			if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+				rtCaches.DNSCache.Put(domain, &DNSCacheEntry{NXDomain: true}, 10*time.Second)
+				return nil, ErrDNSNXDomain
+			}
+			return nil, err
+		}
+		
+		var validIPs []string
+		for _, ip := range ips {
+			if net.ParseIP(ip).To4() != nil {
+				validIPs = append(validIPs, ip)
+			}
+		}
+
+		rtCaches.DNSCache.Put(domain, &DNSCacheEntry{IPs: validIPs}, 10*time.Second)
+		return validIPs, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.([]string), nil
 }
 
 // ================= CIDR & SAMPLING =================
@@ -1611,7 +1557,7 @@ func limitStr(s string, limit int) string {
 	return s
 }
 
-func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRanges []ipRange, vpsIP string) []Candidate {
+func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRanges []ipRange) []Candidate {
 	pipeStats := NewPipelineStats()
 	pipeStats.mu.Lock()
 	pipeStats.IPSampled = len(sampledIPs)
@@ -1650,6 +1596,16 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		return nil
 	}
 
+	for _, d := range cfg.Domains {
+		if cleaned := CleanDomain(d); cleaned != "" {
+			pairsMu.Lock()
+			if len(sampledIPs) > 0 {
+				allPairs = append(allPairs, TargetPair{IP: sampledIPs[0], SNI: cleaned, Evidence: SourceSeed})
+			}
+			pairsMu.Unlock()
+		}
+	}
+
 	uniqueDomsD := make(map[string]bool)
 	for _, p := range allPairs {
 		uniqueDomsD[p.SNI] = true
@@ -1664,11 +1620,24 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	}
 
 	var validPairs []TargetPair
-	var pairSeen sync.Map
+
+	if cfg.Mode == ModeDirect && cfg.DirectSNI != "" {
+		sni := CleanDomain(cfg.DirectSNI)
+		if sni != "" {
+			for _, ip := range sampledIPs {
+				validPairs = append(validPairs, TargetPair{
+					IP:       ip,
+					SNI:      sni,
+					Evidence: SourceSeed,
+				})
+			}
+		}
+	}
 
 	fmt.Printf("[*] STAGE D: DNS Validation (%d Pairs)...\n", len(allPairs))
 	var uniqueResolvedIPs sync.Map
 	var uniqueTargetIPs sync.Map
+	var pairSeen sync.Map
 
 	jobs := make(chan TargetPair, len(allPairs))
 	for _, p := range allPairs {
@@ -1690,8 +1659,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 				pipeStats.DNSQueries++
 				pipeStats.mu.Unlock()
 
-				// Используем ECS резолвер (через 8.8.8.8) для точной привязки CDN к нашему VPS
-				ips, err := resolveHostECS(ctx, p.SNI, vpsIP, rtCaches)
+				ips, err := resolveHostCached(ctx, p.SNI, rtCaches)
 
 				pipeStats.mu.Lock()
 				if err != nil {
@@ -1734,9 +1702,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 				for _, resolvedIP := range ips {
 					uniqueResolvedIPs.Store(resolvedIP, struct{}{})
 
-					// ИСПРАВЛЕНИЕ: Проверяем, совпадает ли IP из DNS *именно с тем IP*, на котором мы нашли домен.
-					// Это возвращает старую сверхточную логику связки.
-					if resolvedIP == p.IP {
+					if resolvedIP == p.IP || ipInRanges(resolvedIP, scanRanges) {
 						uniqueTargetIPs.Store(resolvedIP, struct{}{})
 						matched = true
 
@@ -2138,13 +2104,13 @@ func main() {
 		fmt.Printf("[*] ВНИМАНИЕ: DNS валидация проверяет все %d префиксов ASN для расширения покрытия.\n", len(allPrefixes))
 		fmt.Printf("[*] Подготовлено %d IP адресов для сэмплинга. Запуск...\n\n", len(sampledIPs))
 
-		results = RunPipeline(ctx, cfg, sampledIPs, dnsRanges, vpsQueryIP)
+		results = RunPipeline(ctx, cfg, sampledIPs, dnsRanges)
 
 	} else if cfg.Mode == ModeDirect {
 		merged := MergeCIDRs(cfg.CIDRs)
 		sampledIPs := generateIPs(cfg.CIDRs, cfg.MaxIPs)
 		fmt.Printf("[*] Direct Mode: Подготовлено %d IP адресов. Запуск...\n", len(sampledIPs))
-		results = RunPipeline(ctx, cfg, sampledIPs, merged, vpsQueryIP) // vpsQueryIP will be empty in Direct Mode by default unless specified
+		results = RunPipeline(ctx, cfg, sampledIPs, merged)
 	}
 
 	if len(results) == 0 {
@@ -2152,7 +2118,7 @@ func main() {
 		return
 	}
 
-	fmt.Printf("\n[+] Найдено валидных HTTP/2 целей: %d\n\n", len(results))
+	fmt.Printf("\n[+] Найдено валидных HTTP/2 целей (после кластеризации): %d\n\n", len(results))
 	fmt.Printf("%-36s | %-15s | %-5s | %-4s | %-4s | %-4s | %-4s | %-4s | %-5s | %-6s | %4s %4s %4s\n",
 		"Цель (SNI)", "IP адрес", "SCORE", "TLS", "CERT", "H2", "SRV", "HTTP", "DSCOV", "STATUS", "TCP", "TLS", "H2")
 	fmt.Println(strings.Repeat("-", 126))
