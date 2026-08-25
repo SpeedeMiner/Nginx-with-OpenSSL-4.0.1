@@ -2548,75 +2548,40 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 // ================= MAIN =================
 
 func main() {
-	cfg := Config{}
-	var modeStr, domainsStr string
+	cfg := Config{
+		Mode:              ModeAuto,
+		Workers:           1000,
+		DNSWorkers:        128,
+		MaxIPs:            0,
+		TCPTimeoutMs:      3000,
+		TLSTimeoutMs:      3000,
+		H2ReadTimeoutMs:   3000,
+		H2WriteTimeoutMs:  2000,
+		DNSQueryTimeoutMs: 1500,
+		ECSPrefix:         24,
+		DNSResolvers:      normalizeDNSResolvers(strings.Split(DefaultDNSResolvers, ",")),
+		DNSTrace:          false,
+		DNSTraceLimit:     0,
+		TargetASN:         "",
+		TargetCountry:     "",
+		DirectSNI:         "",
+		Domains:           nil,
+		NoPTR:             false,
+		NoActiveTLS:       false,
+	}
 
-	flag.StringVar(&modeStr, "mode", "autonomous", "autonomous | direct")
 	flag.IntVar(&cfg.Workers, "w", 1000, "Worker pool size for TLS/TCP probing")
-	flag.IntVar(&cfg.DNSWorkers, "dns-workers", 128, "Worker pool size for DNS validation")
-	flag.IntVar(&cfg.DNSQueryTimeoutMs, "dns-timeout", 1500, "Per-resolver raw UDP DNS timeout ms")
-	flag.IntVar(&cfg.ECSPrefix, "ecs-prefix", 24, "EDNS Client Subnet IPv4 prefix length (0..32, default 24)")
-	flag.BoolVar(&cfg.DNSTrace, "dns-trace", false, "Query every configured resolver for selected domains and print resolver -> A records")
-	flag.IntVar(&cfg.DNSTraceLimit, "dns-trace-limit", 20, "Maximum number of unique domains to compare in -dns-trace (0 = unlimited)")
-	var dnsResolversStr string
-	flag.StringVar(&dnsResolversStr, "dns", DefaultDNSResolvers, "Comma-separated raw UDP DNS resolver IPv4 addresses")
-	flag.IntVar(&cfg.MaxIPs, "max-ips", 0, "Limit for IP sampling (0 = no hard limit, will scan all generated IPs)")
-	flag.IntVar(&cfg.TCPTimeoutMs, "tcp-timeout", 3000, "TCP timeout ms")
-	flag.IntVar(&cfg.TLSTimeoutMs, "tls-timeout", 3000, "TLS timeout ms")
-	flag.IntVar(&cfg.H2ReadTimeoutMs, "h2-read", 3000, "H2 Read timeout ms")
-	flag.IntVar(&cfg.H2WriteTimeoutMs, "h2-write", 2000, "H2 Write timeout ms")
-	flag.StringVar(&cfg.TargetCountry, "c", "", "Hard Filter: Target Country Code")
-	flag.StringVar(&cfg.TargetASN, "asn", "", "Hard Filter: Target ASN constraint (e.g., AS12345)")
-	flag.StringVar(&cfg.TargetIP, "vps-ip", "", "IP сервера для поиска сети (запуск с ПК); также используется как ECS IP, если -ecs-ip не задан")
-	flag.StringVar(&cfg.ECSIP, "ecs-ip", "", "Explicit IPv4 address to place into EDNS Client Subnet")
-	flag.StringVar(&cfg.DirectSNI, "sni", "", "Fallback SNI for Direct mode")
-	flag.StringVar(&domainsStr, "domains", "", "Comma-separated seed domains for OSINT")
-
-	flag.BoolVar(&cfg.NoPTR, "no-ptr", false, "Disable Reverse DNS PTR lookups")
-	flag.BoolVar(&cfg.NoActiveTLS, "no-tls-probe", false, "Disable direct IP TLS certificate extraction")
-
+	flag.StringVar(&cfg.TargetIP, "vps-ip", "", "IP сервера для поиска сети; также используется как ECS IP")
 	flag.Parse()
 
+	if flag.NArg() != 0 {
+		log.Fatalf("[-] Positional arguments are not supported; use only -w and -vps-ip")
+	}
 	if cfg.Workers < 1 {
 		cfg.Workers = 1
 	}
-	if cfg.DNSWorkers < 1 {
-		cfg.DNSWorkers = 1
-	}
-	if cfg.DNSQueryTimeoutMs < 250 {
-		cfg.DNSQueryTimeoutMs = 250
-	}
-	if cfg.ECSPrefix < 0 || cfg.ECSPrefix > 32 {
-		log.Fatalf("[-] -ecs-prefix must be between 0 and 32")
-	}
-	if cfg.DNSTraceLimit < 0 {
-		cfg.DNSTraceLimit = 0
-	}
-	cfg.DNSResolvers = normalizeDNSResolvers(strings.Split(dnsResolversStr, ","))
 	if len(cfg.DNSResolvers) == 0 {
-		log.Fatal("[-] DNS resolver pool is empty; use -dns with IPv4 addresses")
-	}
-	cfg.Mode = Mode(modeStr)
-	cfg.CIDRs = flag.Args()
-
-	if domainsStr != "" {
-		for _, d := range strings.Split(domainsStr, ",") {
-			if cleaned := CleanDomain(d); cleaned != "" {
-				cfg.Domains = append(cfg.Domains, cleaned)
-			}
-		}
-	}
-
-	if cfg.Mode != ModeAuto && cfg.Mode != ModeDirect {
-		log.Fatalf("[-] Unknown mode: %s", cfg.Mode)
-	}
-	if cfg.Mode == ModeDirect {
-		if len(cfg.CIDRs) == 0 {
-			log.Fatal("[-] Direct mode requires at least one IPv4 CIDR")
-		}
-		if CleanDomain(cfg.DirectSNI) == "" {
-			log.Fatal("[-] Direct mode requires -sni target explicitly")
-		}
+		log.Fatal("[-] Built-in DNS resolver pool is empty")
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -2625,9 +2590,8 @@ func main() {
 	var vpsQueryIP string
 
 	// ECS identity:
-	//   1) explicit -ecs-ip
-	//   2) -vps-ip
-	//   3) detected public IPv4
+	//   1) -vps-ip when provided
+	//   2) detected public IPv4
 	// The same ECS IP is used for every Stage D DNS query in this run.
 	if cfg.ECSIP != "" {
 		parsed := net.ParseIP(cfg.ECSIP)
@@ -2742,11 +2706,6 @@ func main() {
 
 		results = RunPipeline(ctx, cfg, sampledIPs, dnsRanges)
 
-	} else if cfg.Mode == ModeDirect {
-		merged := MergeCIDRs(cfg.CIDRs)
-		sampledIPs := generateIPs(cfg.CIDRs, cfg.MaxIPs)
-		fmt.Printf("[*] Direct Mode: Подготовлено %d IP адресов. Запуск...\n", len(sampledIPs))
-		results = RunPipeline(ctx, cfg, sampledIPs, merged)
 	}
 
 	if len(results) == 0 {
