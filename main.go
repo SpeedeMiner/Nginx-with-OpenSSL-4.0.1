@@ -20,7 +20,6 @@ import (
 	"os/signal"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,7 +32,6 @@ import (
 	"github.com/oschwald/geoip2-golang"
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2/hpack"
-	"golang.org/x/net/publicsuffix"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
 )
@@ -60,12 +58,13 @@ const (
 	FlagPriority   = 0x20
 	FlagAck        = 0x01
 
-	dnsFastPoolSize      = 32
+	dnsFastPoolSize = 32
+
 	LimitMaxIPs          = 262144
-	MaxHostsPer24        = 254
-	MaxSampled24         = 4
 	MaxDiscoveredDomains = 50000
 	LimitValidPairs      = 10000
+	MaxHostsPer24        = 254
+	MaxSampled24         = 4
 )
 
 var (
@@ -84,9 +83,6 @@ var (
 	domainRe = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$`)
 	numRe    = regexp.MustCompile(`(?i)(^|\.)\d+\.[a-z]{2,}$`)
 	stampRe  = regexp.MustCompile(`^sdns://[A-Za-z0-9_-]+=*$`)
-
-	uaRng *rand.Rand
-	uaMu  sync.Mutex
 )
 
 type Config struct {
@@ -111,7 +107,7 @@ type Config struct {
 	NoActiveTLS      bool
 }
 
-// ================= EVIDENCE =================
+// ================= EVIDENCE & PROVENANCE =================
 
 type DomainSource uint32
 
@@ -129,6 +125,62 @@ type Evidence struct {
 }
 
 func (e Evidence) Combined() DomainSource { return e.Direct | e.Inherited }
+
+type DiscoveryState struct {
+	mu                          sync.RWMutex
+	domainEvidence              map[string]Evidence
+	pairEvidence                map[string]Evidence
+	domainsToResolve            map[string]struct{}
+	domainsCount                int
+	droppedDomainsByGlobalLimit int
+	droppedValidPairs           int
+}
+
+func NewDiscoveryState() *DiscoveryState {
+	return &DiscoveryState{
+		domainEvidence:   make(map[string]Evidence),
+		pairEvidence:     make(map[string]Evidence),
+		domainsToResolve: make(map[string]struct{}),
+	}
+}
+
+func (s *DiscoveryState) AddDomainSource(d string, direct, inherited DomainSource) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.domainsToResolve[d]; !exists {
+		if s.domainsCount >= MaxDiscoveredDomains {
+			s.droppedDomainsByGlobalLimit++
+			return
+		}
+		s.domainsToResolve[d] = struct{}{}
+		s.domainsCount++
+	}
+
+	ev := s.domainEvidence[d]
+	ev.Direct |= direct
+	ev.Inherited |= inherited
+	s.domainEvidence[d] = ev
+}
+
+func (s *DiscoveryState) AddPairSource(ip, d string, src DomainSource) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.domainsToResolve[d]; !exists {
+		if s.domainsCount >= MaxDiscoveredDomains {
+			s.droppedDomainsByGlobalLimit++
+			return
+		}
+		s.domainsToResolve[d] = struct{}{}
+		s.domainsCount++
+	}
+
+	key := ip + "\x00" + d
+	evP := s.pairEvidence[key]
+	evP.Direct |= src
+	s.pairEvidence[key] = evP
+}
 
 // ================= MODELS =================
 
@@ -230,6 +282,8 @@ type TargetPair struct {
 type PipelineStats struct {
 	mu                    sync.Mutex
 	IPSampled             int
+	IPWithPTR             int
+	IPWithDirectTLS       int
 	ActiveProbes          int
 	UniqueDomains         int
 	DNSQueries            int
@@ -237,9 +291,14 @@ type PipelineStats struct {
 	DNSFailed             int
 	DNSNXDomain           int
 	DNSTimeout            int
+	DNSTemporary          int
+	DNSNoIPv4             int
 	DNSOtherErr           int
 	DNSResolvedIPs        int
+	DNSUniqueResolvedIPs  int
+	DNSUniqueTargetIPs    int
 	DNSTargetRangeMatches int
+	DNSTargetDomains      int
 	DNSValidPairs         int
 	TCPConnected          int
 	TLSHandshake          int
@@ -249,8 +308,7 @@ type PipelineStats struct {
 	EndStreamOK           int
 	ASNFiltered           int
 	CountryFiltered       int
-	IPWithPTR             int
-	IPWithDirectTLS       int
+	CDNDropped            int
 }
 
 func NewPipelineStats() *PipelineStats {
@@ -816,7 +874,6 @@ func activeProbeIP(ctx context.Context, ip string, pool *DNSPool, timeout time.D
 						if d := CleanDomain(ptr.Ptr); d != "" {
 							results[d] |= SourcePTR
 							
-							// Fallback TLS using PTR as SNI
 							if !noTLS {
 								cDoms := extractDomainsFromTLS(ctx, ip, d, timeout)
 								if len(cDoms) > 0 && len(cDoms) <= 15 {
@@ -833,6 +890,8 @@ func activeProbeIP(ctx context.Context, ip string, pool *DNSPool, timeout time.D
 	}
 	return results
 }
+
+var ErrDNSNXDomain = errors.New("NXDOMAIN")
 
 func resolveIPv4Cached(ctx context.Context, pool *DNSPool, domain string, rtCaches *RuntimeCaches) ([]string, error) {
 	domain = CleanDomain(domain)
@@ -1131,6 +1190,25 @@ func reverseIPv4(ip string) (string, error) {
 }
 
 // ================= HTTP/2 PROBE =================
+const clientAdvertisedMaxFrameSize = 16384
+
+type ProbeStage int
+
+const (
+	ProbeStageTCP ProbeStage = iota
+	ProbeStageTLS
+	ProbeStageTLSValidation
+	ProbeStageH2
+	ProbeStageHeaders
+	ProbeStageComplete
+)
+
+type ProbeError struct {
+	Stage ProbeStage
+	Err   error
+}
+
+func (e *ProbeError) Error() string { return e.Err.Error() }
 
 func writeH2(conn net.Conn, b []byte, timeout time.Duration) error {
 	conn.SetWriteDeadline(time.Now().Add(timeout))
@@ -1278,13 +1356,6 @@ func parseTrailers(cand *Candidate, headers []hpack.HeaderField) error {
 	}
 	return nil
 }
-
-type ProbeError struct {
-	Stage ProbeStage
-	Err   error
-}
-
-func (e *ProbeError) Error() string { return e.Err.Error() }
 
 func ProbeH2(ctx context.Context, ip, sni string, ev DomainSource, cfg Config) (*Candidate, *ProbeError) {
 	cand := &Candidate{
@@ -2176,7 +2247,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	fmt.Printf("    Детали DNS ошибок:         Timeout: %d, Temporary: %d, Other: %d\n", s.DNSTimeout, s.DNSTemporary, s.DNSOtherErr)
 	fmt.Printf("[*] Target Range IP Matches:   %d\n", s.DNSTargetRangeMatches)
 	fmt.Printf("[*] Подтверждено DNS-пар:      %d\n\n", s.DNSValidPairs)
-	
+
 	fmt.Printf("[*] Успешных TCP соединений:   %d\n", s.TCPConnected)
 	fmt.Printf("[*] Успешных TLS хэндшейков:   %d\n", s.TLSHandshake)
 	fmt.Printf("[*] С откликом H2 Headers:     %d\n", s.H2HeadersOK)
