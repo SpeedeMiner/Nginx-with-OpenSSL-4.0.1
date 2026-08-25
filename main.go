@@ -1118,7 +1118,8 @@ func dnsExchangeUDP(ctx context.Context, resolver, domain, ecsIP string, ecsPref
 	if err != nil {
 		return nil, err
 	}
-	return parseDNSAResponse(buf[:n], id)
+	ips, _, parseErr := parseDNSAResponse(buf[:n], id)
+	return ips, parseErr
 }
 
 func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, resolvers []string, timeout time.Duration) ([]string, error) {
