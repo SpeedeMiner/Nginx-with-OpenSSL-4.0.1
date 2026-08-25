@@ -232,6 +232,8 @@ type PipelineStats struct {
 	IPSampled             int
 	ActiveProbes          int
 	UniqueDomains         int
+	
+	// DNS
 	DNSQueries            int
 	DNSSuccess            int
 	DNSFailed             int
@@ -244,27 +246,46 @@ type PipelineStats struct {
 	DNSUniqueResolvedIPs  int
 	DNSUniqueTargetIPs    int
 	DNSTargetRangeMatches int
-	DNSTargetDomains      int
 	DNSValidPairs         int
-	TCPConnected          int
-	TLSHandshake          int
-	NoPeerCertificates    int
-	TLSValidationFailures int
-	H2ProtocolOK          int
-	H2HeadersOK           int
-	EndStreamOK           int
-	H2HPACKErrors         int
-	H2Timeouts            int
-	H2InvalidStatus       int
-	ScoreRejected         int
-	IPWithPTR             int
-	IPWithDirectTLS       int
 
+	// PTR
 	PTRQueriesSent int
 	PTRNoError     int
 	PTRNXDomain    int
 	PTREmptyAnswer int
 	PTRErrors      int
+
+	// TCP
+	TCPConnected          int
+	TCPTimeouts           int
+	TCPRefused            int
+	TCPOtherErrs          int
+
+	// TLS
+	TLSHandshake          int
+	TLSTimeouts           int
+	TLSOtherErrs          int
+	TLSValidationFailures int
+	NoPeerCertificates    int
+
+	// H2
+	H2NoALPN              int
+	H2TimeoutNoFrames     int
+	H2EOF                 int
+	H2OtherErrs           int
+	H2ProtocolOK          int
+	H2HeadersOK           int
+	H2Timeouts            int
+	H2HPACKErrors         int
+	H2InvalidStatus       int
+	H2StatusOK            int
+
+	// Final
+	ScoreRejected         int
+	CandidatesAccepted    int
+	
+	IPWithPTR             int
+	IPWithDirectTLS       int
 }
 
 func NewPipelineStats() *PipelineStats {
@@ -381,7 +402,7 @@ type DNSPool struct {
 	Retries        atomic.Uint64
 	rngMu          sync.Mutex
 	rng            *rand.Rand
-	sem            chan struct{} // Семафор для защиты от шторма UDP-сокетов
+	sem            chan struct{}
 }
 
 type StampCache struct {
@@ -494,7 +515,7 @@ func checkDNSResolver(ctx context.Context, stamp string) (*DNSResolver, error) {
 func buildDNSPool(ctx context.Context, stamps []string, dnsWorkers int) *DNSPool {
 	pool := &DNSPool{
 		rng: rand.New(rand.NewSource(time.Now().UnixNano())),
-		sem: make(chan struct{}, dnsWorkers), // ИСПРАВЛЕНИЕ: Семафор для защиты пула
+		sem: make(chan struct{}, dnsWorkers),
 	}
 	pool.Discovered.Store(uint64(len(stamps)))
 
@@ -546,7 +567,6 @@ func (p *DNSPool) pickWeighted() *DNSResolver {
 	}
 	p.mu.RUnlock()
 
-	// ИСПРАВЛЕНИЕ: Self-healing. Если все упали, мгновенно оживляем весь пул
 	if len(available) == 0 {
 		p.mu.Lock()
 		for _, r := range p.resolvers {
@@ -622,7 +642,6 @@ func (p *DNSPool) resolverFailure(r *DNSResolver) uint64 {
 }
 
 func (p *DNSPool) exchange(ctx context.Context, req *mdns.Msg) (*mdns.Msg, *DNSResolver, time.Duration, error) {
-	// ИСПРАВЛЕНИЕ: Ждем свободного слота (защита от локального UDP шторма)
 	p.sem <- struct{}{}
 	defer func() { <-p.sem }()
 
@@ -645,7 +664,7 @@ func (p *DNSPool) exchange(ctx context.Context, req *mdns.Msg) (*mdns.Msg, *DNSR
 
 		client := &dnscrypt.Client{Net: "udp", Timeout: 2500 * time.Millisecond}
 		info := resolver.getInfo()
-		req.Id = mdns.Id() // Явно генерируем ID для каждого ретрая
+		req.Id = mdns.Id()
 
 		type exRes struct {
 			resp *mdns.Msg
@@ -670,7 +689,6 @@ func (p *DNSPool) exchange(ctx context.Context, req *mdns.Msg) (*mdns.Msg, *DNSR
 		elapsed := time.Since(start)
 
 		if err != nil {
-			// ИСПРАВЛЕНИЕ: Не штрафуем резолверы за локальную отмену контекста
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return nil, nil, 0, err
 			}
@@ -766,11 +784,16 @@ func getCountry(ip string) string {
 		return ""
 	}
 	defer resp.Body.Close()
-	var result struct {
-		CountryCode string `json:"countryCode"`
+	
+	if resp.StatusCode == 200 {
+		var result struct {
+			CountryCode string `json:"countryCode"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
+			return strings.ToUpper(result.CountryCode)
+		}
 	}
-	json.NewDecoder(resp.Body).Decode(&result)
-	return strings.ToUpper(result.CountryCode)
+	return "UNKNOWN"
 }
 
 func getASNAndPrefix(ip string) (string, string) {
@@ -856,7 +879,7 @@ func getPrefixes(asn string) []string {
 	json.NewDecoder(resp.Body).Decode(&result)
 	var prefixes []string
 	for _, p := range result.Data.Prefixes {
-		if !strings.Contains(p.Prefix, ":") {
+		if !strings.Contains(p.Prefix, ":") { // Только IPv4
 			prefixes = append(prefixes, p.Prefix)
 		}
 	}
@@ -1156,7 +1179,7 @@ func activeProbeIP(ctx context.Context, ip string, pool *DNSPool, timeout time.D
 		}
 	}
 
-	// 4. ДЕДУПЛИКАЦИЯ И УМНАЯ ОБРЕЗКА (max 5)
+	// 4. ДЕДУПЛИКАЦИЯ И УМНАЯ ОБРЕЗКА (Ослаблено до max 15 на IP)
 	uniqueDoms := uniqueStrings(allDoms)
 	
 	sort.Slice(uniqueDoms, func(i, j int) bool {
@@ -1178,8 +1201,8 @@ func activeProbeIP(ctx context.Context, ip string, pool *DNSPool, timeout time.D
 		return uniqueDoms[i] < uniqueDoms[j]
 	})
 
-	if len(uniqueDoms) > 5 {
-		uniqueDoms = uniqueDoms[:5]
+	if len(uniqueDoms) > 15 {
+		uniqueDoms = uniqueDoms[:15]
 	}
 
 	result := make(map[string]DomainSource, len(uniqueDoms))
@@ -1490,7 +1513,7 @@ func ProbeH2(ctx context.Context, ip, sni string, ev DomainSource, cfg Config) (
 		Evidence:      ev,
 		DomainQuality: classifyDomainQuality(sni),
 		CDNStatus:     CDNStatusUnknown,
-		HTTPStatus:    0,
+		HTTPStatus:    0, // ИСПРАВЛЕНИЕ: Ждем реального статуса
 	}
 
 	t0 := time.Now()
@@ -1842,7 +1865,14 @@ func scoreH2Profile(c *Candidate) float64 {
 }
 
 func validateAndEnrich(cand *Candidate, cfg Config, pipeStats *PipelineStats) bool {
-	if !cand.H2ProtocolConfirmed || !cand.H2HeadersReceived || cand.MissingStatus || cand.HTTPStatus <= 0 {
+	// ИСПРАВЛЕНИЕ: Жесткая проверка: должен быть распарсен H2 Headers и валидный HTTP Status > 0.
+	if !cand.H2ProtocolConfirmed {
+		return false
+	}
+	if !cand.H2HeadersReceived {
+		return false
+	}
+	if cand.MissingStatus || cand.HTTPStatus <= 0 {
 		return false
 	}
 
@@ -1950,13 +1980,6 @@ func validateAndEnrich(cand *Candidate, cfg Config, pipeStats *PipelineStats) bo
 	cand.Score = rs.Total - scorePenalty
 
 	return true
-}
-
-func limitStr(s string, limit int) string {
-	if len(s) > limit {
-		return s[:limit]
-	}
-	return s
 }
 
 func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRanges []ipRange, pool *DNSPool) []Candidate {
@@ -2193,61 +2216,98 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 			if gCtxE.Err() != nil {
 				return gCtxE.Err()
 			}
+			
 			cand, pErr := ProbeH2(gCtxE, p.IP, p.SNI, p.Evidence, cfg)
 
-			tcpOK := pErr == nil || pErr.Stage > ProbeStageTCP
-			tlsOK := pErr == nil || pErr.Stage > ProbeStageTLS
-
 			pipeStats.mu.Lock()
-			if tcpOK {
-				pipeStats.TCPConnected++
+			defer pipeStats.mu.Unlock()
+
+			// 1. TCP 
+			if pErr != nil && pErr.Stage == ProbeStageTCP {
+				if os.IsTimeout(pErr.Err) || strings.Contains(pErr.Err.Error(), "deadline") {
+					pipeStats.TCPTimeouts++
+				} else if strings.Contains(pErr.Err.Error(), "refused") {
+					pipeStats.TCPRefused++
+				} else {
+					pipeStats.TCPOtherErrs++
+				}
+				return nil
 			}
-			if tlsOK {
-				pipeStats.TLSHandshake++
+			pipeStats.TCPConnected++
+
+			// 2. TLS
+			if pErr != nil && (pErr.Stage == ProbeStageTLS || pErr.Stage == ProbeStageTLSValidation) {
+				if os.IsTimeout(pErr.Err) || strings.Contains(pErr.Err.Error(), "deadline") {
+					pipeStats.TLSTimeouts++
+				} else if strings.Contains(pErr.Err.Error(), "no peer certificates") {
+					pipeStats.NoPeerCertificates++
+				} else if pErr.Stage == ProbeStageTLSValidation {
+					pipeStats.TLSValidationFailures++
+				} else {
+					pipeStats.TLSOtherErrs++
+				}
+				return nil
 			}
-			if cand != nil && cand.H2ProtocolConfirmed {
-				pipeStats.H2ProtocolOK++
-			}
-			if cand != nil && cand.H2HeadersReceived {
-				pipeStats.H2HeadersOK++
-			}
-			if cand != nil && cand.HPACKErrors {
-				pipeStats.H2HPACKErrors++
-			}
-			if cand != nil && cand.ReadTimeout {
-				pipeStats.H2Timeouts++
-			}
-			if cand != nil && cand.H2ProtocolConfirmed && (cand.MissingStatus || cand.HTTPStatus <= 0) {
-				pipeStats.H2InvalidStatus++
+			pipeStats.TLSHandshake++
+
+			// 3. H2 Protocol
+			if cand != nil && cand.ALPN != "h2" {
+				pipeStats.H2NoALPN++
 			}
 
 			if pErr != nil {
-				if pErr.Stage == ProbeStageTLSValidation {
-					if strings.Contains(pErr.Err.Error(), "no peer certificates") {
-						pipeStats.NoPeerCertificates++
-					} else {
-						pipeStats.TLSValidationFailures++
-					}
+				if os.IsTimeout(pErr.Err) || strings.Contains(pErr.Err.Error(), "deadline") || (cand != nil && cand.ReadTimeout) {
+					pipeStats.H2TimeoutNoFrames++
+				} else if errors.Is(pErr.Err, io.EOF) || strings.Contains(pErr.Err.Error(), "EOF") || strings.Contains(pErr.Err.Error(), "connection reset") {
+					pipeStats.H2EOF++
+				} else {
+					pipeStats.H2OtherErrs++
 				}
-				pipeStats.mu.Unlock()
 				return nil
 			}
 
-			if cand != nil && cand.EndStreamSeen {
+			if cand == nil || !cand.H2ProtocolConfirmed {
+				pipeStats.H2OtherErrs++
+				return nil
+			}
+			pipeStats.H2ProtocolOK++
+
+			// 4. H2 Headers
+			if !cand.H2HeadersReceived {
+				if cand.ReadTimeout {
+					pipeStats.H2Timeouts++ // Таймаут во время ожидания заголовков
+				} else if cand.HPACKErrors {
+					pipeStats.H2HPACKErrors++
+				} else {
+					pipeStats.H2OtherErrs++
+				}
+				return nil
+			}
+			pipeStats.H2HeadersOK++
+
+			// 5. H2 HTTP Status
+			if cand.MissingStatus || cand.HTTPStatus <= 0 {
+				pipeStats.H2InvalidStatus++
+				return nil
+			}
+			pipeStats.H2StatusOK++
+
+			if cand.EndStreamSeen {
 				pipeStats.EndStreamOK++
 			}
-			pipeStats.mu.Unlock()
 
+			// 6. Score & Enrich
 			if !validateAndEnrich(cand, cfg, pipeStats) {
-				pipeStats.mu.Lock()
 				pipeStats.ScoreRejected++
-				pipeStats.mu.Unlock()
 				return nil
 			}
 
+			// 7. Success
+			pipeStats.CandidatesAccepted++
 			candMu.Lock()
 			candidates = append(candidates, *cand)
 			candMu.Unlock()
+			
 			return nil
 		})
 	}
@@ -2302,21 +2362,16 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	fmt.Printf("[*] IP с сертификатами (TLS):  %d\n", s.IPWithDirectTLS)
 	fmt.Printf("[*] Найдено уник. доменов:     %d\n\n", s.UniqueDomains)
 
-	fmt.Printf("[*] Logical DNS Lookups:       %d (Успех: %d, Ошибок: %d)\n", s.DNSQueries, s.DNSSuccess, s.DNSFailed)
-	fmt.Printf("    Детали DNS успехов:        Resolved IPs: %d, NXDOMAIN: %d, NoIPv4: %d\n", s.DNSResolvedIPs, s.DNSNXDomain, s.DNSNoIPv4)
-	fmt.Printf("    Детали DNS ошибок:         Timeout: %d, Temporary: %d, Other: %d\n", s.DNSTimeout, s.DNSTemporary, s.DNSOtherErr)
-	fmt.Printf("    Детали PTR запросов:       Sent: %d, NOERROR: %d, Empty: %d, NXDOMAIN: %d, Err: %d\n", s.PTRQueriesSent, s.PTRNoError, s.PTREmptyAnswer, s.PTRNXDomain, s.PTRErrors)
-	fmt.Printf("[*] Target Range IP Matches:   %d\n", s.DNSTargetRangeMatches)
-	fmt.Printf("[*] Подтверждено DNS-пар:      %d\n\n", s.DNSValidPairs)
-
-	fmt.Printf("[*] Успешных TCP соединений:   %d\n", s.TCPConnected)
-	fmt.Printf("[*] Успешных TLS хэндшейков:   %d\n", s.TLSHandshake)
-	fmt.Printf("[*] Подтверждён протокол H2:   %d (любой H2 фрейм)\n", s.H2ProtocolOK)
-	fmt.Printf("[*] С откликом H2 Headers:     %d\n", s.H2HeadersOK)
-	fmt.Printf("    - С ошибками HPACK:        %d (игнорируются)\n", s.H2HPACKErrors)
-	fmt.Printf("    - Таймаут чтения (спасён): %d (ранний выход)\n", s.H2Timeouts)
-	fmt.Printf("    - Без валидного :status:   %d (отброшены)\n", s.H2InvalidStatus)
-	fmt.Printf("    - Отклонено по Score (<0): %d\n", s.ScoreRejected)
+	fmt.Printf("[*] Анализ Stage E (IP+SNI -> Final Candidates):\n")
+	fmt.Printf("    - DNS-пары для проверки:       %d\n", s.DNSValidPairs)
+	fmt.Printf("    - Успешных TCP соединений:     %d (Timeouts: %d, Refused: %d, Other: %d)\n", s.TCPConnected, s.TCPTimeouts, s.TCPRefused, s.TCPOtherErrs)
+	fmt.Printf("    - Успешных TLS хэндшейков:     %d (Timeouts: %d, CertValidation: %d, NoCert: %d, Other: %d)\n", s.TLSHandshake, s.TLSTimeouts, s.TLSValidationFailures, s.NoPeerCertificates, s.TLSOtherErrs)
+	fmt.Printf("    - Без ALPN 'h2':               %d (но протокол тестировался)\n", s.H2NoALPN)
+	fmt.Printf("    - Подтверждён протокол H2:     %d (Timeouts/NoFrames: %d, EOF/RST: %d, Other: %d)\n", s.H2ProtocolOK, s.H2TimeoutNoFrames, s.H2EOF, s.H2OtherErrs)
+	fmt.Printf("    - Получены H2 Headers:         %d (Timeouts/NoHeaders: %d, HPACK Errors: %d)\n", s.H2HeadersOK, s.H2Timeouts, s.H2HPACKErrors)
+	fmt.Printf("    - Валидный HTTP Status:        %d (Missing/Zero Status: %d)\n", s.H2StatusOK, s.H2InvalidStatus)
+	fmt.Printf("    - Принято кандидатов:          %d (Отклонено по Score: %d)\n\n", s.CandidatesAccepted, s.ScoreRejected)
+	
 	fmt.Printf("[*] Уникальных IP-кластеров:   %d\n", len(ipClusters))
 	fmt.Printf("[*] Кандидатов в выводе:       %d\n", len(clusteredCandidates))
 	s.mu.Unlock()
@@ -2438,7 +2493,7 @@ func main() {
 		}
 
 		var targetPrefixes []string
-		if cfg.TargetCountry != "" {
+		if cfg.TargetCountry != "" && cfg.TargetCountry != "UNKNOWN" {
 			targetPrefixes = filterPrefixesByCountry(allPrefixes, cfg.TargetCountry)
 			
 			vpsIPObj := net.ParseIP(vpsQueryIP)
