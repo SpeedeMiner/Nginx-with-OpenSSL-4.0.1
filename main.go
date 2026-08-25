@@ -71,7 +71,6 @@ const (
 var (
 	cdnStrong     = []string{"cloudflare", "fastly", "akamai", "ddos-guard", "qrator", "sucuri"}
 	cdnWeak       = []string{"x-cache", "x-served-by", "x-edge"}
-	bannedServers = []string{"cloudflare", "fastly", "akamai", "ddos-guard", "qrator", "sucuri"}
 
 	bannedTLDs = map[string]bool{
 		"crl": true, "ocsp": true, "der": true, "crt": true, "cer": true, "pem": true,
@@ -85,8 +84,7 @@ var (
 	numRe    = regexp.MustCompile(`(?i)(^|\.)\d+\.[a-z]{2,}$`)
 	stampRe  = regexp.MustCompile(`^sdns://[A-Za-z0-9_-]+=*$`)
 
-	ErrProviderNoData = errors.New("provider returned no data")
-	ErrDNSNXDomain    = errors.New("NXDOMAIN")
+	ErrDNSNXDomain = errors.New("NXDOMAIN")
 
 	uaRng *rand.Rand
 	uaMu  sync.Mutex
@@ -105,7 +103,6 @@ type Config struct {
 	TargetCountry    string
 	TargetIP         string
 	DirectSNI        string
-	ScanEntireASN    bool
 	CIDRs            []string
 	Domains          []string
 	GeoIPPath        string
@@ -255,8 +252,6 @@ type PipelineStats struct {
 	TLSValidationFailures int
 	H2HeadersOK           int
 	EndStreamOK           int
-	ASNFiltered           int
-	CountryFiltered       int
 	IPWithPTR             int
 	IPWithDirectTLS       int
 }
@@ -772,7 +767,30 @@ func reverseIPv4(ip string) (string, error) {
 	return fmt.Sprintf("%d.%d.%d.%d.in-addr.arpa.", parsed[3], parsed[2], parsed[1], parsed[0]), nil
 }
 
-// ================= ACTIVE RECON (TLS + PTR) =================
+// ================= ACTIVE RECON (TLS + PTR + OSINT) =================
+
+func getOSINTDomains(ip string) []string {
+	var domains []string
+	client := &http.Client{Timeout: 4 * time.Second}
+	req, _ := http.NewRequest("GET", fmt.Sprintf("https://otx.alienvault.com/api/v1/indicators/IPv4/%s/passive_dns", ip), nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	if resp, err := client.Do(req); err == nil {
+		defer resp.Body.Close()
+		var res struct {
+			PassiveDNS []struct {
+				Hostname string `json:"hostname"`
+			} `json:"passive_dns"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&res); err == nil {
+			for _, r := range res.PassiveDNS {
+				if d := CleanDomain(r.Hostname); d != "" {
+					domains = append(domains, d)
+				}
+			}
+		}
+	}
+	return domains
+}
 
 func extractDomainsFromTLS(ctx context.Context, ip, sni string, timeout time.Duration) []string {
 	dialer := &net.Dialer{Timeout: timeout}
@@ -835,8 +853,6 @@ func activeProbeIP(ctx context.Context, ip string, pool *DNSPool, timeout time.D
 					if ptr, ok := ans.(*mdns.PTR); ok {
 						if d := CleanDomain(ptr.Ptr); d != "" {
 							results[d] |= SourcePTR
-
-							// Fallback TLS using PTR as SNI
 							if !noTLS {
 								cDoms := extractDomainsFromTLS(ctx, ip, d, timeout)
 								if len(cDoms) > 0 && len(cDoms) <= 15 {
@@ -851,6 +867,23 @@ func activeProbeIP(ctx context.Context, ip string, pool *DNSPool, timeout time.D
 			}
 		}
 	}
+
+	if len(results) == 0 {
+		osints := getOSINTDomains(ip)
+		for _, osint := range osints {
+			results[osint] |= SourceSeed
+			if !noTLS {
+				cDoms := extractDomainsFromTLS(ctx, ip, osint, timeout)
+				if len(cDoms) > 0 && len(cDoms) <= 15 {
+					for _, cd := range cDoms {
+						results[cd] |= SourceDirectTLS
+					}
+					break // Поведение старого сканера: останавливаемся после первого успешного TLS
+				}
+			}
+		}
+	}
+
 	return results
 }
 
@@ -1071,64 +1104,51 @@ func MergeCIDRs(cidrs []string) []ipRange {
 	return merged
 }
 
-func SampleIPs(blocks []ipRange, maxIPs int, seed int64) []string {
-	var totalIPs uint64
-	for _, b := range blocks {
-		totalIPs += (b.end - b.start + 1)
-	}
-	if totalIPs == 0 {
-		return nil
-	}
-	var sampleSize uint64
-	switch {
-	case maxIPs < -1:
-		return nil
-	case maxIPs == -1:
-		sampleSize = totalIPs
-	case maxIPs == 0:
-		sampleSize = 1024
-		if sampleSize > totalIPs {
-			sampleSize = totalIPs
-		}
-	default:
-		sampleSize = uint64(maxIPs)
-		if sampleSize > totalIPs {
-			sampleSize = totalIPs
+func inc(ip net.IP) {
+	for j := len(ip) - 1; j >= 0; j-- {
+		ip[j]++
+		if ip[j] > 0 {
+			break
 		}
 	}
-	if sampleSize > LimitMaxIPs {
-		sampleSize = LimitMaxIPs
-	}
-	if sampleSize == 0 {
-		return nil
-	}
-	rng := rand.New(rand.NewSource(seed))
-	currIdx := rng.Uint64() % totalIPs
-	var step uint64 = 1
-	if totalIPs > 1 {
-		for {
-			step = (rng.Uint64() % (totalIPs - 1)) + 1
-			if gcd(step, totalIPs) == 1 {
-				break
+}
+
+func generateIPs(cidrs []string, maxIPs int) []string {
+	var ips []string
+	seen := make(map[string]bool)
+
+	for _, pStr := range cidrs {
+		if maxIPs > 0 && len(ips) >= maxIPs {
+			break
+		}
+		ip, ipnet, err := net.ParseCIDR(pStr)
+		if err != nil {
+			continue
+		}
+
+		ones, _ := ipnet.Mask.Size()
+		limit := MaxHostsPer24
+		if ones < 24 {
+			limit = MaxHostsPer24 * MaxSampled24
+		}
+
+		count := 0
+		for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); inc(ip) {
+			ipStr := ip.String()
+			if !seen[ipStr] && !strings.HasSuffix(ipStr, ".0") && !strings.HasSuffix(ipStr, ".255") {
+				seen[ipStr] = true
+				ips = append(ips, ipStr)
+				count++
+				if maxIPs > 0 && len(ips) >= maxIPs {
+					return ips
+				}
+				if count >= limit {
+					break
+				}
 			}
 		}
 	}
-	var result []string
-	for i := uint64(0); i < sampleSize; i++ {
-		offset := currIdx
-		for _, b := range blocks {
-			count := b.end - b.start + 1
-			if offset < count {
-				ip := make(net.IP, 4)
-				binary.BigEndian.PutUint32(ip, uint32(b.start+offset))
-				result = append(result, ip.String())
-				break
-			}
-			offset -= count
-		}
-		currIdx = (currIdx + step) % totalIPs
-	}
-	return result
+	return ips
 }
 
 func ipInRanges(ipStr string, ranges []ipRange) bool {
@@ -1858,7 +1878,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	pipeStats.mu.Lock()
 	pipeStats.IPSampled = len(sampledIPs)
 	pipeStats.mu.Unlock()
-	
+
 	rtCaches := NewRuntimeCaches()
 
 	discoveredDomains := make(map[string]DomainSource)
@@ -1930,6 +1950,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 
 	var validPairs []TargetPair
 	var pairSeen sync.Map
+	var pairsMu sync.Mutex
 
 	if cfg.Mode == ModeDirect && cfg.DirectSNI != "" {
 		sni := CleanDomain(cfg.DirectSNI)
@@ -1937,11 +1958,13 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 			for _, ip := range sampledIPs {
 				key := ip + "\x00" + sni
 				if _, loaded := pairSeen.LoadOrStore(key, true); !loaded {
+					pairsMu.Lock()
 					validPairs = append(validPairs, TargetPair{
 						IP:       ip,
 						SNI:      sni,
 						Evidence: SourceSeed,
 					})
+					pairsMu.Unlock()
 				}
 			}
 		}
@@ -2011,34 +2034,6 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 				uniqueResolvedIPs.Store(resolvedIP, struct{}{})
 
 				if ipInRanges(resolvedIP, scanRanges) {
-					parsedIP := net.ParseIP(resolvedIP)
-					if parsedIP != nil {
-						var asn uint
-						var country string
-						if asnDB != nil {
-							if r, err := asnDB.ASN(parsedIP); err == nil {
-								asn = uint(r.AutonomousSystemNumber)
-							}
-						}
-						if countryDB != nil {
-							if r, err := countryDB.Country(parsedIP); err == nil {
-								country = r.Country.IsoCode
-							}
-						}
-						if cfg.TargetASN != 0 && asn != cfg.TargetASN {
-							pipeStats.mu.Lock()
-							pipeStats.ASNFiltered++
-							pipeStats.mu.Unlock()
-							continue
-						}
-						if cfg.TargetCountry != "" && !strings.EqualFold(country, cfg.TargetCountry) {
-							pipeStats.mu.Lock()
-							pipeStats.CountryFiltered++
-							pipeStats.mu.Unlock()
-							continue
-						}
-					}
-
 					uniqueTargetIPs.Store(resolvedIP, struct{}{})
 					matched = true
 
@@ -2048,8 +2043,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 
 					pairKey := resolvedIP + "\x00" + dom
 					if _, loaded := pairSeen.LoadOrStore(pairKey, true); !loaded {
-						var mu sync.Mutex
-						mu.Lock()
+						pairsMu.Lock()
 						if len(validPairs) < LimitValidPairs {
 							validPairs = append(validPairs, TargetPair{
 								IP:       resolvedIP,
@@ -2057,7 +2051,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 								Evidence: src,
 							})
 						}
-						mu.Unlock()
+						pairsMu.Unlock()
 					}
 				}
 			}
@@ -2229,7 +2223,7 @@ func main() {
 
 	flag.StringVar(&modeStr, "mode", "autonomous", "autonomous | direct")
 	flag.IntVar(&cfg.Workers, "w", 30, "Worker pool size for generic tasks")
-	flag.IntVar(&cfg.MaxIPs, "max-ips", 0, "Limit for IP sampling (0 = default 1024, -1 = up to hard safety limit 262144)")
+	flag.IntVar(&cfg.MaxIPs, "max-ips", 0, "Limit for IP sampling (0 = no hard limit, will scan all generated IPs)")
 	flag.IntVar(&cfg.TCPTimeoutMs, "tcp-timeout", 2000, "TCP timeout ms")
 	flag.IntVar(&cfg.TLSTimeoutMs, "tls-timeout", 2000, "TLS timeout ms")
 	flag.IntVar(&cfg.H2ReadTimeoutMs, "h2-read", 3000, "H2 Read timeout ms")
@@ -2239,7 +2233,6 @@ func main() {
 	flag.UintVar(&cfg.TargetASN, "asn", 0, "Hard Filter: Target ASN constraint")
 	flag.StringVar(&cfg.TargetIP, "vps-ip", "", "IP сервера для поиска сети (запуск с ПК)")
 	flag.StringVar(&cfg.DirectSNI, "sni", "", "Fallback SNI for Direct mode")
-	flag.BoolVar(&cfg.ScanEntireASN, "scan-all-asn", false, "Scan all ASN prefixes")
 	flag.StringVar(&domainsStr, "domains", "", "Comma-separated seed domains for OSINT")
 	flag.StringVar(&cfg.GeoIPPath, "geoip", "GeoLite2-Country.mmdb", "Path to Country DB")
 	flag.StringVar(&cfg.ASNPath, "asn-db", "GeoLite2-ASN.mmdb", "Path to ASN DB")
@@ -2279,9 +2272,6 @@ func main() {
 		if CleanDomain(cfg.DirectSNI) == "" {
 			log.Fatal("[-] Direct mode requires -sni target explicitly")
 		}
-	}
-	if cfg.MaxIPs == -1 {
-		fmt.Printf("[!] ВНИМАНИЕ: Выбран режим полного сканирования (-1 = до %d адресов).\n", LimitMaxIPs)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -2324,7 +2314,7 @@ func main() {
 	}
 	fmt.Printf("[+] Рабочий DNSCrypt pool: %d resolver'ов\n", poolSize)
 
-	var vpsQueryIP, localPrefix string
+	var vpsQueryIP string
 
 	if cfg.Mode == ModeAuto {
 		ip, err := getPublicIP(cfg.TargetIP)
@@ -2357,35 +2347,13 @@ func main() {
 		if err != nil || len(cidrs) == 0 {
 			log.Fatalf("[-] Failed to fetch CIDRs for AS%d", cfg.TargetASN)
 		}
-		vpsIPObj := net.ParseIP(vpsQueryIP)
-		for _, c := range cidrs {
-			_, ipnet, _ := net.ParseCIDR(c)
-			if ipnet != nil && ipnet.Contains(vpsIPObj) {
-				localPrefix = c
-				break
-			}
-		}
-		var samplingCIDRs []string
-		if !cfg.ScanEntireASN {
-			if localPrefix == "" {
-				log.Fatal("[-] Target IP is not present in ASN announced prefixes. Use --scan-all-asn.")
-			}
-			samplingCIDRs = []string{localPrefix}
-		} else {
-			samplingCIDRs = cidrs
-		}
 
-		samplingRanges := MergeCIDRs(samplingCIDRs)
-		sampledIPs := SampleIPs(samplingRanges, cfg.MaxIPs, cfg.Seed)
+		sampledIPs := generateIPs(cidrs, cfg.MaxIPs)
 		dnsRanges := MergeCIDRs(cidrs)
 
 		fmt.Printf("[*] Целевой IP:             %s\n", vpsQueryIP)
 		fmt.Printf("[*] Announcing ASN:         AS%d\n", cfg.TargetASN)
-		if !cfg.ScanEntireASN {
-			fmt.Printf("[*] Фокус на IPv4 prefix:    %s (DNS-валидация по всем %d префиксам ASN)\n", localPrefix, len(cidrs))
-		} else {
-			fmt.Printf("[*] Фокус на все префиксы:   %d подсетей ASN\n", len(cidrs))
-		}
+		fmt.Printf("[*] Фокус на все префиксы:   %d подсетей ASN (Полный скан автономной системы)\n", len(cidrs))
 		fmt.Printf("[*] Страна сервера:          %s (MaxMind GeoIP)\n", cfg.TargetCountry)
 		fmt.Printf("[*] Подготовлено %d IP адресов для OSINT-сэмплинга. Запуск...\n\n", len(sampledIPs))
 
@@ -2393,7 +2361,7 @@ func main() {
 
 	} else if cfg.Mode == ModeDirect {
 		merged := MergeCIDRs(cfg.CIDRs)
-		sampledIPs := SampleIPs(merged, cfg.MaxIPs, cfg.Seed)
+		sampledIPs := generateIPs(cfg.CIDRs, cfg.MaxIPs)
 		fmt.Printf("[*] Direct Mode: Подготовлено %d IP адресов. Запуск...\n", len(sampledIPs))
 		results = RunPipeline(ctx, cfg, sampledIPs, merged, dnsPool, asnDB, countryDB)
 	}
