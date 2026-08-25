@@ -23,7 +23,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -76,6 +75,9 @@ var (
 	numRe    = regexp.MustCompile(`(?i)(^|\.)\d+\.[a-z]{2,}$`)
 
 	ErrDNSNXDomain = errors.New("NXDOMAIN")
+
+	uaRng *rand.Rand
+	uaMu  sync.Mutex
 )
 
 type Config struct {
@@ -87,6 +89,7 @@ type Config struct {
 	TLSTimeoutMs     int
 	H2ReadTimeoutMs  int
 	H2WriteTimeoutMs int
+	Seed             int64
 	TargetASN        string
 	TargetCountry    string
 	TargetIP         string
@@ -226,9 +229,13 @@ type PipelineStats struct {
 	DNSNXDomain           int
 	DNSTimeout            int
 	DNSTemporary          int
+	DNSNoIPv4             int
 	DNSOtherErr           int
 	DNSResolvedIPs        int
+	DNSUniqueResolvedIPs  int
+	DNSUniqueTargetIPs    int
 	DNSTargetRangeMatches int
+	DNSTargetDomains      int
 	DNSValidPairs         int
 
 	// PTR
@@ -595,6 +602,18 @@ func classifyDomainQuality(sni string) string {
 	return "Normal"
 }
 
+func reverseIPv4(ip string) (string, error) {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return "", fmt.Errorf("invalid IP")
+	}
+	parsed = parsed.To4()
+	if parsed == nil {
+		return "", fmt.Errorf("not IPv4")
+	}
+	return fmt.Sprintf("%d.%d.%d.%d.in-addr.arpa.", parsed[3], parsed[2], parsed[1], parsed[0]), nil
+}
+
 // ================= ACTIVE RECON (TLS + PTR + OSINT) =================
 
 func getOSINTDomains(ip string) []string {
@@ -669,11 +688,11 @@ func activeProbeIP(ctx context.Context, ip string, timeout time.Duration, noPTR 
 		sourceMap[d] |= src
 	}
 
-	// 1. Direct TLS (Dead IP Drop)
+	// 1. Direct TLS
 	if !noTLS {
 		doms, err := extractDomainsFromTLS(ctx, ip, ip, timeout)
 		if err != nil {
-			return nil // Dead IP, skip PTR and OSINT completely
+			return nil // Dead IP, skip
 		}
 		if len(doms) > 0 {
 			pipeStats.mu.Lock()
@@ -684,7 +703,7 @@ func activeProbeIP(ctx context.Context, ip string, timeout time.Duration, noPTR 
 				addDomain(d, SourceDirectTLS)
 			}
 			
-			// СТАРЫЙ СКАНЕР: Ранний выход, если нашли SAN. Не делаем PTR/OSINT.
+			// Ранний выход как в старой версии, если нашли прямые домены (не грузим сеть лишними запросами)
 			if len(doms) <= 15 {
 				for d, src := range sourceMap {
 					pairs = append(pairs, TargetPair{IP: ip, SNI: d, Evidence: src})
@@ -694,7 +713,7 @@ func activeProbeIP(ctx context.Context, ip string, timeout time.Duration, noPTR 
 		}
 	}
 
-	// 2. PTR via net.LookupAddr (Fast OS Resolver)
+	// 2. Нативный быстрый PTR 
 	if !noPTR {
 		pipeStats.mu.Lock()
 		pipeStats.PTRQueriesSent++
@@ -712,7 +731,6 @@ func activeProbeIP(ctx context.Context, ip string, timeout time.Duration, noPTR 
 				if ptrDomain != "" {
 					addDomain(ptrDomain, SourcePTR)
 					
-					// TLS(PTR) -> SAN
 					if !noTLS {
 						cDoms, _ := extractDomainsFromTLS(ctx, ip, ptrDomain, timeout)
 						for _, cd := range cDoms {
@@ -728,7 +746,7 @@ func activeProbeIP(ctx context.Context, ip string, timeout time.Duration, noPTR 
 		}
 	}
 
-	// 3. OSINT (Fallback)
+	// 3. OSINT 
 	if len(sourceMap) < 5 {
 		osints := getOSINTDomains(ip)
 		for _, osint := range osints {
@@ -738,25 +756,22 @@ func activeProbeIP(ctx context.Context, ip string, timeout time.Duration, noPTR 
 			}
 			addDomain(osint, SourceSeed)
 
-			// TLS(OSINT) -> SAN
 			if !noTLS {
 				cDoms, _ := extractDomainsFromTLS(ctx, ip, osint, timeout)
 				if len(cDoms) > 0 {
 					for _, cd := range cDoms {
 						addDomain(cd, SourceDirectTLS)
 					}
-					break // Прекращаем перебор OSINT после удачного TLS
+					break
 				}
 			}
 		}
 	}
 
-	// 4. Построение TargetPairs для этого IP
 	for d, src := range sourceMap {
 		pairs = append(pairs, TargetPair{IP: ip, SNI: d, Evidence: src})
 	}
 
-	// 5. Умная обрезка для IP (ограничиваем до 25 лучших доменов)
 	sort.Slice(pairs, func(i, j int) bool {
 		weight := func(s DomainSource) int {
 			w := 0
@@ -792,7 +807,6 @@ func resolveHostCached(ctx context.Context, domain string, rtCaches *RuntimeCach
 			return cached.IPs, nil
 		}
 		
-		// Используем системный резолвер
 		ips, err := net.LookupHost(domain)
 		if err != nil {
 			var dnsErr *net.DNSError
@@ -803,7 +817,6 @@ func resolveHostCached(ctx context.Context, domain string, rtCaches *RuntimeCach
 			return nil, err
 		}
 		
-		// Фильтруем только IPv4
 		var validIPs []string
 		for _, ip := range ips {
 			if net.ParseIP(ip).To4() != nil {
@@ -1579,10 +1592,6 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	for _, d := range cfg.Domains {
 		if cleaned := CleanDomain(d); cleaned != "" {
 			pairsMu.Lock()
-			// Добавляем seed-домены ко всем IP-адресам (так как мы не знаем, к какому IP они относятся)
-			// Это упрощенная логика. В идеале Seed-домены нужно резолвить отдельно, 
-			// но чтобы не ломать архитектуру `IP+SNI`, мы "размазываем" их по случайному IP из пула, 
-			// а Stage D всё равно отбросит их, если они не резолвятся.
 			if len(sampledIPs) > 0 {
 				allPairs = append(allPairs, TargetPair{IP: sampledIPs[0], SNI: cleaned, Evidence: SourceSeed})
 			}
@@ -1621,6 +1630,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	fmt.Printf("[*] STAGE D: DNS Validation (%d Pairs)...\n", len(allPairs))
 	var uniqueResolvedIPs sync.Map
 	var uniqueTargetIPs sync.Map
+	var pairSeen sync.Map
 
 	jobs := make(chan TargetPair, len(allPairs))
 	for _, p := range allPairs {
@@ -1693,12 +1703,19 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 						pipeStats.DNSTargetRangeMatches++
 						pipeStats.mu.Unlock()
 
-						pairsMu.Lock()
-						if len(validPairs) < LimitValidPairs {
-							validPairs = append(validPairs, p)
+						pairKey := resolvedIP + "\x00" + p.SNI
+						if _, loaded := pairSeen.LoadOrStore(pairKey, true); !loaded {
+							pairsMu.Lock()
+							if len(validPairs) < LimitValidPairs {
+								validPairs = append(validPairs, TargetPair{
+									IP:       resolvedIP, // Обновляем IP на свежий из DNS
+									SNI:      p.SNI,
+									Evidence: p.Evidence,
+								})
+							}
+							pairsMu.Unlock()
 						}
-						pairsMu.Unlock()
-						break // Достаточно одного совпадения для пары
+						break 
 					}
 				}
 				if matched {
@@ -1971,7 +1988,6 @@ func main() {
 	flag.IntVar(&cfg.TLSTimeoutMs, "tls-timeout", 3000, "TLS timeout ms")
 	flag.IntVar(&cfg.H2ReadTimeoutMs, "h2-read", 3000, "H2 Read timeout ms")
 	flag.IntVar(&cfg.H2WriteTimeoutMs, "h2-write", 2000, "H2 Write timeout ms")
-	flag.Int64Var(&cfg.Seed, "seed", time.Now().UnixNano(), "Random seed")
 	flag.StringVar(&cfg.TargetCountry, "c", "", "Hard Filter: Target Country Code")
 	flag.StringVar(&cfg.TargetASN, "asn", "", "Hard Filter: Target ASN constraint (e.g., AS12345)")
 	flag.StringVar(&cfg.TargetIP, "vps-ip", "", "IP сервера для поиска сети (запуск с ПК)")
@@ -1982,12 +1998,6 @@ func main() {
 	flag.BoolVar(&cfg.NoActiveTLS, "no-tls-probe", false, "Disable direct IP TLS certificate extraction")
 
 	flag.Parse()
-
-	if cfg.Seed != 0 {
-		uaMu.Lock()
-		uaRng = rand.New(rand.NewSource(cfg.Seed))
-		uaMu.Unlock()
-	}
 
 	if cfg.Workers < 1 {
 		cfg.Workers = 1
@@ -2079,7 +2089,6 @@ func main() {
 		}
 
 		sampledIPs := generateIPs(targetPrefixes, cfg.MaxIPs)
-
 		dnsRanges := MergeCIDRs(allPrefixes)
 
 		fmt.Printf("[*] Целевой IP:             %s\n", vpsQueryIP)
@@ -2103,7 +2112,7 @@ func main() {
 		return
 	}
 
-	fmt.Printf("\n[+] Найдено валидных HTTP/2 целей (после кластеризации): %d\n\n", len(results))
+	fmt.Printf("\n[+] Найдено валидных HTTP/2 целей: %d\n\n", len(results))
 	fmt.Printf("%-36s | %-15s | %-5s | %-4s | %-4s | %-4s | %-4s | %-4s | %-5s | %-6s | %4s %4s %4s\n",
 		"Цель (SNI)", "IP адрес", "SCORE", "TLS", "CERT", "H2", "SRV", "HTTP", "DSCOV", "STATUS", "TCP", "TLS", "H2")
 	fmt.Println(strings.Repeat("-", 126))
