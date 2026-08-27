@@ -32,7 +32,6 @@ import (
 	mdns "github.com/miekg/dns"
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2/hpack"
-	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
 )
 
