@@ -1,6 +1,6 @@
 package main
 
-// reality-scanner-active-v81: local active scanner
+// reality-scanner-active-v82: local active scanner
 
 import (
 	"bytes"
@@ -83,13 +83,18 @@ const (
 )
 
 var (
+	bannedTLDs = map[string]bool{
+		"crl": true, "ocsp": true, "der": true, "crt": true, "cer": true, "pem": true,
+		"arpa": true, "local": true, "internal": true, "invalid": true, "example": true, "test": true, "localhost": true,
+	}
+
 	cdnStrong = []string{"cloudflare", "fastly", "akamai", "ddos-guard", "qrator", "sucuri"}
 	cdnWeak   = []string{"x-cache", "x-served-by", "x-edge"}
 	junkTLDs  = []string{".xyz", ".top", ".site", ".fun", ".online", ".space", ".pw", ".cc", ".icu", ".click", ".win", ".bid", ".date"}
 	dynDNS    = []string{"duckdns.org", "mooo.com", "ddns.net", "freeddns.org", "crabdance.com", "eu.org", "cloudns.cc", "hopto.org", "zapto.org", "sytes.net", "dyn.com", "no-ip.org"}
 
-	domainRe = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$`)
-	numRe    = regexp.MustCompile(`(?i)(^|\\.)\\d+\\.[a-z]{2,}$`)
+	domainRe = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$`)
+	numRe    = regexp.MustCompile(`(?i)(^|\.)\d+\.[a-z]{2,}$`)
 
 	ErrDNSNXDomain  = errors.New("NXDOMAIN")
 	ErrDNSNoData    = errors.New("DNS no data")
@@ -247,6 +252,7 @@ type TargetPair struct {
 type PipelineStats struct {
 	mu                    sync.Mutex
 	IPSampled             int
+	IPWithDirectTLS       int
 	IPWithPTR             int
 	PTRQueriesSent        int
 	PTRFound              int
@@ -649,49 +655,6 @@ func (c *SafeDNSCache) Put(key string, entry *DNSCacheEntry, ttl time.Duration) 
 		ips = append([]string(nil), entry.IPs...)
 	}
 	c.data[key] = &DNSCacheEntry{IPs: ips, NXDomain: entry.NXDomain, Expires: time.Now().Add(ttl)}
-}
-
-type CacheItem struct {
-	Values  []string
-	Status  StatResult
-	Expires time.Time
-}
-
-type SafeCache struct {
-	mu   sync.RWMutex
-	data map[string]CacheItem
-}
-
-func NewSafeCache() *SafeCache {
-	return &SafeCache{data: make(map[string]CacheItem)}
-}
-
-func (c *SafeCache) Get(key string) ([]string, StatResult, bool) {
-	c.mu.RLock()
-	v, ok := c.data[key]
-	c.mu.RUnlock()
-	if !ok {
-		return nil, StatFailed, false
-	}
-	if time.Now().After(v.Expires) {
-		c.mu.Lock()
-		if v2, ok2 := c.data[key]; ok2 && time.Now().After(v2.Expires) {
-			delete(c.data, key)
-		}
-		c.mu.Unlock()
-		return nil, StatFailed, false
-	}
-	return append([]string(nil), v.Values...), v.Status, true
-}
-
-func (c *SafeCache) Put(key string, vals []string, status StatResult, ttl time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.data[key] = CacheItem{
-		Values:  append([]string(nil), vals...),
-		Status:  status,
-		Expires: time.Now().Add(ttl),
-	}
 }
 
 // ================= DNS TRANSPORT =================
@@ -2843,8 +2806,6 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 
 	fmt.Printf("[*] STAGE A: Active certificate/SNI discovery (Direct TLS + resilient PTR)...\n")
 	allPairs := make([]TargetPair, 0, len(sampledIPs))
-	var pairsMu sync.Mutex
-	allPairs := make([]TargetPair, 0, len(sampledIPs))
 	// Use a bounded worker pool over the sampled IPs.
 	var pairsMu sync.Mutex
 	var idxMu sync.Mutex
@@ -3262,6 +3223,169 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	}
 	rtCaches.DNSStatsMu.Unlock()
 	return clustered
+}
+
+func getASNAndPrefix(ip string) (string, string) {
+	client := &http.Client{Timeout: 6 * time.Second}
+	var asn, prefix string
+
+	resp, err := client.Get(fmt.Sprintf("https://stat.ripe.net/data/network-info/data.json?resource=%s", ip))
+	if err == nil {
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			var result struct {
+				Data struct {
+					ASNs   []interface{} `json:"asns"`
+					Prefix string        `json:"prefix"`
+				} `json:"data"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
+				if len(result.Data.ASNs) > 0 {
+					asn = fmt.Sprintf("%v", result.Data.ASNs[0])
+					if !strings.HasPrefix(strings.ToUpper(asn), "AS") {
+						asn = "AS" + asn
+					}
+				}
+				prefix = result.Data.Prefix
+			}
+		}
+	}
+
+	if asn == "" {
+		resp2, err2 := client.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=as", ip))
+		if err2 == nil {
+			if resp2.StatusCode == http.StatusOK {
+				var res2 struct {
+					AS string `json:"as"`
+				}
+				if err := json.NewDecoder(resp2.Body).Decode(&res2); err == nil && res2.AS != "" {
+					parts := strings.Split(res2.AS, " ")
+					if len(parts) > 0 {
+						asn = strings.ToUpper(parts[0])
+						if !strings.HasPrefix(asn, "AS") {
+							asn = "AS" + asn
+						}
+					}
+				}
+			}
+			resp2.Body.Close()
+		}
+	}
+
+	if asn == "" {
+		asn = "UNKNOWN_ASN"
+	}
+	if prefix == "" {
+		ip4 := net.ParseIP(ip).To4()
+		if ip4 != nil {
+			prefix = fmt.Sprintf("%d.%d.%d.0/24", ip4[0], ip4[1], ip4[2])
+		}
+	}
+	return asn, prefix
+}
+
+func getCountry(ip string) string {
+	client := &http.Client{Timeout: 4 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=countryCode", ip))
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 200 {
+		var result struct {
+			CountryCode string `json:"countryCode"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
+			return strings.ToUpper(result.CountryCode)
+		}
+	}
+	return "UNKNOWN"
+}
+
+func getPrefixes(asn string) []string {
+	if asn == "UNKNOWN_ASN" {
+		return nil
+	}
+
+	client := &http.Client{Timeout: 6 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("https://stat.ripe.net/data/announced-prefixes/data.json?resource=%s", asn))
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	var result struct {
+		Data struct {
+			Prefixes []struct {
+				Prefix string `json:"prefix"`
+			} `json:"prefixes"`
+		} `json:"data"`
+	}
+	json.NewDecoder(resp.Body).Decode(&result)
+	var prefixes []string
+	for _, p := range result.Data.Prefixes {
+		if !strings.Contains(p.Prefix, ":") {
+			prefixes = append(prefixes, p.Prefix)
+		}
+	}
+	return prefixes
+}
+
+func filterPrefixesByCountry(prefixes []string, targetCountry string) []string {
+	if targetCountry == "" || len(prefixes) == 0 || targetCountry == "UNKNOWN" {
+		return prefixes
+	}
+	targetCountry = strings.ToUpper(targetCountry)
+
+	type QueryItem struct {
+		Query string `json:"query"`
+	}
+
+	queryToPrefix := make(map[string]string)
+	var allQueries []QueryItem
+
+	for _, p := range prefixes {
+		ip, _, err := net.ParseCIDR(p)
+		if err == nil {
+			qIP := ip.String()
+			queryToPrefix[qIP] = p
+			allQueries = append(allQueries, QueryItem{Query: qIP})
+		}
+	}
+
+	var matched []string
+	batchSize := 100
+
+	for i := 0; i < len(allQueries); i += batchSize {
+		end := i + batchSize
+		if end > len(allQueries) {
+			end = len(allQueries)
+		}
+		batch := allQueries[i:end]
+
+		reqBody, _ := json.Marshal(batch)
+		resp, err := http.Post("http://ip-api.com/batch?fields=query,countryCode,status", "application/json", bytes.NewBuffer(reqBody))
+		if err != nil {
+			continue
+		}
+
+		var resData []struct {
+			Query       string `json:"query"`
+			CountryCode string `json:"countryCode"`
+			Status      string `json:"status"`
+		}
+		json.NewDecoder(resp.Body).Decode(&resData)
+		resp.Body.Close()
+
+		for _, item := range resData {
+			if item.Status == "success" && strings.ToUpper(item.CountryCode) == targetCountry {
+				if pref, ok := queryToPrefix[item.Query]; ok {
+					matched = append(matched, pref)
+				}
+			}
+		}
+	}
+	return matched
 }
 
 // ================= MAIN =================
