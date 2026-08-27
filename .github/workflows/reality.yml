@@ -14,7 +14,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.22'
+        go-version: '1.27'
 
     - name: Build Windows binary
       run: |
@@ -23,7 +23,9 @@ jobs:
         # Скачиваем основные зависимости явно (для надежности перед tidy)
         go get github.com/refraction-networking/utls
         go get golang.org/x/net/http2/hpack
-        
+        go get golang.org/x/sync/errgroup
+        go get golang.org/x/sync/singleflight
+        go get golang.org/x/net/publicsuffix
         go mod tidy
         
         # Сборка только для Windows. Флаги -s -w уменьшают размер exe файла.
