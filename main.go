@@ -3138,8 +3138,14 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		clusters[c.IP] = append(clusters[c.IP], c)
 	}
 	candidateLess := func(a, b Candidate) bool {
+		// Final selection is quality-first: Reality feasibility, then the full
+		// weighted score. RTT is deliberately only a late tie-breaker so a
+		// slightly slower but materially better SNI is not discarded.
 		if a.RealityFeasible != b.RealityFeasible {
 			return a.RealityFeasible
+		}
+		if a.Score != b.Score {
+			return a.Score > b.Score
 		}
 		if a.CertSNIMatch != b.CertSNIMatch {
 			return a.CertSNIMatch
@@ -3175,9 +3181,6 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		}
 		if a.Timings.TotalProbeLatency() != b.Timings.TotalProbeLatency() {
 			return a.Timings.TotalProbeLatency() < b.Timings.TotalProbeLatency()
-		}
-		if a.Score != b.Score {
-			return a.Score > b.Score
 		}
 		return a.SNI < b.SNI
 	}
