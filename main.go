@@ -3415,9 +3415,6 @@ func main() {
 	if cfg.Workers < 1 {
 		cfg.Workers = 1
 	}
-	if cfg.Workers > 256 {
-		cfg.Workers = 256
-	}
 	cfg.DNSWorkers = cfg.Workers * 2
 	if cfg.DNSWorkers < 8 {
 		cfg.DNSWorkers = 8
