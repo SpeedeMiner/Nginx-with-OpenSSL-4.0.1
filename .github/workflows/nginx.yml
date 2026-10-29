@@ -1,4 +1,4 @@
-name: Build Nginx main + OpenSSL master (stable GCC 16.2.0)
+name: Build Nginx main + OpenSSL master (prebuilt GCC 16.2.0)
 
 on:
   workflow_dispatch:
@@ -8,7 +8,9 @@ permissions:
 
 env:
   GCC_RELEASE: "16.2.0"
-  GCC_PREFIX: "/opt/gcc-16.2.0"
+  GCC_TOOLCHAIN_RELEASE: "1.4.0"
+  GCC_TRIPLET: "x86_64-focal-linux-gnu"
+  GCC_TOOLCHAIN_ROOT: "/opt/x-tools/x86_64-focal-linux-gnu"
   TARGET_GLIBC: "2.39"
 
 jobs:
@@ -17,99 +19,155 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Install build dependencies
+      - name: Install Nginx/OpenSSL build dependencies
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          # Use Ubuntu's official HTTPS mirror even if the runner image uses Azure.
+          set -euo pipefail
+          # Use Ubuntu's official HTTPS archive if the runner image has Azure mirrors.
           sudo find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
             -exec sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' {} +
 
           sudo apt-get update -o Acquire::Retries=3 -o Acquire::https::Timeout=15
           sudo apt-get install -y \
             build-essential \
-            bison \
-            flex \
-            libgmp-dev \
-            libmpfr-dev \
-            libmpc-dev \
-            libisl-dev \
-            zlib1g-dev \
-            libzstd-dev \
-            texinfo \
             binutils \
+            ca-certificates \
+            curl \
             file \
             git \
+            libbrotli-dev \
+            libcrypt-dev \
+            libpcre2-dev \
+            libzstd-dev \
             make \
             perl \
             python3 \
             wget \
-            libcrypt-dev \
-            libpcre2-dev \
-            libbrotli-dev
+            xz-utils \
+            zlib1g-dev
 
           test "$(uname -m)" = "x86_64"
 
-      - name: Build stable GCC 16.2.0 from official source
+      - name: Install prebuilt stable GCC 16.2.0 toolchain
         env:
-          DEBIAN_FRONTEND: noninteractive
+          TOOLCHAIN_RELEASE: ${{ env.GCC_TOOLCHAIN_RELEASE }}
+          TOOLCHAIN_ROOT: ${{ env.GCC_TOOLCHAIN_ROOT }}
+          GCC_RELEASE: ${{ env.GCC_RELEASE }}
+          GCC_TRIPLET: ${{ env.GCC_TRIPLET }}
         run: |
           set -euo pipefail
-          GCC_RELEASE="${{ env.GCC_RELEASE }}"
-          GCC_PREFIX="${{ env.GCC_PREFIX }}"
-          ARCHIVE="gcc-${GCC_RELEASE}.tar.xz"
-          URL="https://gcc.gnu.org/pub/gcc/releases/gcc-${GCC_RELEASE}/${ARCHIVE}"
+          ASSET="x-tools-${GCC_TRIPLET}-gcc16.tar.xz"
+          RELEASE_API="https://api.github.com/repos/tttapa/toolchains/releases/tags/${TOOLCHAIN_RELEASE}"
+          ARCHIVE_URL="https://github.com/tttapa/toolchains/releases/download/${TOOLCHAIN_RELEASE}/${ASSET}"
+          ARCHIVE="$RUNNER_TEMP/${ASSET}"
 
-          # This fixed SHA-512 is published in GCC's official release directory.
-          EXPECTED_SHA512="c51c30ca7422d0cbecf504b2e0f33c3aca31e0f90a76b65217f465163fa6fa17b3f5de39e145c47e5bab90ac0ce7fff3b03c8d553ae36e01faaea5a50f8648d1"
-          cd "$RUNNER_TEMP"
-          wget --https-only --tries=3 --timeout=30 -O "$ARCHIVE" "$URL"
-          printf '%s  %s\n' "$EXPECTED_SHA512" "$ARCHIVE" | sha512sum --check -
-          tar -xf "$ARCHIVE"
+          # The prebuilt bundle comes from a fixed release, not a mutable latest URL.
+          # Obtain the SHA-256 published by GitHub for this exact release asset.
+          curl --fail --location --retry 3 --retry-delay 2 \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "$RELEASE_API" -o "$RUNNER_TEMP/toolchains-release.json"
 
-          mkdir -p "$RUNNER_TEMP/gcc-build"
-          cd "$RUNNER_TEMP/gcc-build"
-          "$RUNNER_TEMP/gcc-${GCC_RELEASE}/configure" \
-            --prefix="$GCC_PREFIX" \
-            --enable-languages=c,c++ \
-            --disable-multilib \
-            --disable-nls \
-            --enable-checking=release \
-            --with-system-zlib
+          EXPECTED_SHA256="$(python3 - "$RUNNER_TEMP/toolchains-release.json" "$ASSET" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
 
-          # Bootstrap the released GCC source; do not install the PPA's trunk snapshot.
-          make -j"$(nproc)" bootstrap
-          sudo make install
+          release = json.loads(Path(sys.argv[1]).read_text())
+          asset_name = sys.argv[2]
+          asset = next((a for a in release.get("assets", []) if a.get("name") == asset_name), None)
+          if asset is None:
+              raise SystemExit(f"ERROR: Asset {asset_name!r} not found in pinned release")
+          digest = asset.get("digest", "")
+          if not digest.startswith("sha256:") or len(digest.removeprefix("sha256:")) != 64:
+              raise SystemExit(f"ERROR: GitHub did not provide a valid SHA-256 digest for {asset_name}")
+          print(digest.removeprefix("sha256:"))
+          PY
+          )"
 
-          echo "$GCC_PREFIX/bin" >> "$GITHUB_PATH"
-          export PATH="$GCC_PREFIX/bin:$PATH"
+          curl --fail --location --retry 3 --retry-delay 2 \
+            --output "$ARCHIVE" "$ARCHIVE_URL"
+          printf '%s  %s\n' "$EXPECTED_SHA256" "$ARCHIVE" | sha256sum --check -
+
+          tar -tJf "$ARCHIVE" > "$RUNNER_TEMP/toolchain-archive-files.txt"
+          if ! grep -Eq '^(\./)?x-tools/x86_64-focal-linux-gnu/bin/' "$RUNNER_TEMP/toolchain-archive-files.txt"; then
+            echo "ERROR: Toolchain archive layout is not the expected x-tools tree" >&2
+            exit 1
+          fi
+          # Extract as the runner user first; do not unpack a downloaded tarball as root.
+          mkdir -p "$RUNNER_TEMP/toolchain-unpack"
+          tar -xJf "$ARCHIVE" -C "$RUNNER_TEMP/toolchain-unpack"
+          test -x "$RUNNER_TEMP/toolchain-unpack/x-tools/x86_64-focal-linux-gnu/bin/${GCC_TRIPLET}-gcc"
+          sudo mkdir -p /opt
+          sudo cp -a "$RUNNER_TEMP/toolchain-unpack/x-tools" /opt/
+
+          GCC_BIN="$TOOLCHAIN_ROOT/bin/${GCC_TRIPLET}-gcc"
+          GXX_BIN="$TOOLCHAIN_ROOT/bin/${GCC_TRIPLET}-g++"
+          for compiler in "$GCC_BIN" "$GXX_BIN"; do
+            if [ ! -x "$compiler" ]; then
+              echo "ERROR: Expected compiler executable not found: $compiler" >&2
+              exit 1
+            fi
+          done
+
+          # Use the prebuilt compiler, but target the runner's Ubuntu 24.04 sysroot
+          # rather than the toolchain's bundled Focal sysroot. This keeps the final
+          # binary's GLIBC baseline tied to Ubuntu 24.04 (GLIBC 2.39).
+          WRAPPER_DIR="$RUNNER_TEMP/gcc16-wrapper-bin"
+          mkdir -p "$WRAPPER_DIR"
+          cat > "$WRAPPER_DIR/gcc" <<EOF
+          #!/usr/bin/env bash
+          exec "$GCC_BIN" --sysroot=/ "\$@"
+          EOF
+          cat > "$WRAPPER_DIR/g++" <<EOF
+          #!/usr/bin/env bash
+          exec "$GXX_BIN" --sysroot=/ "\$@"
+          EOF
+          chmod +x "$WRAPPER_DIR/gcc" "$WRAPPER_DIR/g++"
+
+          echo "$WRAPPER_DIR" >> "$GITHUB_PATH"
+          echo "$TOOLCHAIN_ROOT/bin" >> "$GITHUB_PATH"
+          echo "GCC_WRAPPER_DIR=$WRAPPER_DIR" >> "$GITHUB_ENV"
+          echo "CC=$WRAPPER_DIR/gcc" >> "$GITHUB_ENV"
+          echo "CXX=$WRAPPER_DIR/g++" >> "$GITHUB_ENV"
+          echo "AR=$TOOLCHAIN_ROOT/bin/${GCC_TRIPLET}-ar" >> "$GITHUB_ENV"
+          echo "RANLIB=$TOOLCHAIN_ROOT/bin/${GCC_TRIPLET}-ranlib" >> "$GITHUB_ENV"
+          echo "NM=$TOOLCHAIN_ROOT/bin/${GCC_TRIPLET}-nm" >> "$GITHUB_ENV"
+
+          export PATH="$WRAPPER_DIR:$TOOLCHAIN_ROOT/bin:$PATH"
+          echo "=== Verified prebuilt GCC toolchain ==="
+          gcc --version
+          g++ --version
           ACTUAL_GCC="$(gcc -dumpfullversion -dumpversion)"
           if [ "$ACTUAL_GCC" != "$GCC_RELEASE" ]; then
             echo "ERROR: Expected GCC ${GCC_RELEASE}, got ${ACTUAL_GCC}" >&2
             gcc --version >&2 || true
             exit 1
           fi
-          GCC_BANNER="$(gcc --version | head -n 1)"
-          if printf '%s\n' "$GCC_BANNER" | grep -Eiq 'experimental|trunk|snapshot'; then
-            echo "ERROR: Refusing experimental GCC compiler: $GCC_BANNER" >&2
-            exit 1
-          fi
-          echo "Verified compiler: $GCC_BANNER"
-
-      - name: Verify compiler and static build dependencies
-        run: |
-          set -euo pipefail
-          echo "gcc path: $(command -v gcc)"
-          echo "g++ path: $(command -v g++)"
-          test "$(command -v gcc)" = "${{ env.GCC_PREFIX }}/bin/gcc"
-          test "$(command -v g++)" = "${{ env.GCC_PREFIX }}/bin/g++"
-          gcc --version
-          g++ --version
-          test "$(gcc -dumpfullversion -dumpversion)" = "${{ env.GCC_RELEASE }}"
           if gcc --version | grep -Eiq 'experimental|trunk|snapshot'; then
             echo "ERROR: Experimental compiler detected" >&2
             exit 1
           fi
+          test "$(gcc --sysroot=/ -print-sysroot)" = "/"
+          echo "Verified GCC ${ACTUAL_GCC}; system sysroot is /"
+
+      - name: Verify compiler and static build dependencies
+        run: |
+          set -euo pipefail
+          echo "CC=$CC"
+          echo "CXX=$CXX"
+          test -x "$CC"
+          test -x "$CXX"
+          test "$("$CC" -dumpfullversion -dumpversion)" = "${{ env.GCC_RELEASE }}"
+          test "$("$CXX" -dumpfullversion -dumpversion)" = "${{ env.GCC_RELEASE }}"
+          "$CC" --version
+          "$CXX" --version
+          if "$CC" --version | grep -Eiq 'experimental|trunk|snapshot'; then
+            echo "ERROR: Experimental compiler detected" >&2
+            exit 1
+          fi
+          test "$("$CC" -print-sysroot)" = "/"
 
           MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
           for archive in \
@@ -147,8 +205,8 @@ jobs:
         working-directory: nginx-main
         run: |
           set -euo pipefail
-          export CC="gcc"
-          export CXX="g++"
+          export CC="$GCC_WRAPPER_DIR/gcc"
+          export CXX="$GCC_WRAPPER_DIR/g++"
 
           ./auto/configure \
             --prefix=/etc/nginx \
@@ -192,8 +250,8 @@ jobs:
             --with-stream_ssl_module \
             --with-stream_ssl_preread_module \
             --with-openssl=../openssl-main \
-            --with-openssl-opt='no-shared no-tests enable-zlib enable-brotli enable-zstd -fPIC' \
-            --with-cc-opt='-g -O2 -Wno-error -Werror=implicit-function-declaration -fstack-protector-strong -fstack-clash-protection -Wformat -Werror=format-security -fcf-protection -fPIC' \
+            --with-openssl-opt='no-shared no-tests enable-zlib enable-brotli enable-zstd -std=gnu17 -fPIC' \
+            --with-cc-opt='-std=gnu17 -g -O2 -Wno-error -Werror=implicit-function-declaration -fstack-protector-strong -fstack-clash-protection -Wformat -Werror=format-security -fcf-protection -fPIC' \
             --with-ld-opt='-Wl,-z,relro -Wl,-z,now -pie -static-libgcc -static-libstdc++ -Wl,--as-needed'
 
           # Nginx's OpenSSL build is static, but its optional compression
@@ -376,7 +434,7 @@ jobs:
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: nginx-binary-main-gcc16-stable-16.2.0
+          name: nginx-binary-main-gcc16-prebuilt-16.2.0
           path: nginx
           if-no-files-found: error
           retention-days: 14
@@ -385,16 +443,16 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.sources.outputs.tag_name }}
-          name: "Nginx mainline (${{ steps.sources.outputs.nginx_commit }}) + OpenSSL master (${{ steps.sources.outputs.openssl_commit }}) — GCC ${{ env.GCC_RELEASE }}"
+          name: "Nginx mainline (${{ steps.sources.outputs.nginx_commit }}) + OpenSSL master (${{ steps.sources.outputs.openssl_commit }}) — prebuilt GCC ${{ env.GCC_RELEASE }}"
           body: |
             ### Nginx mainline + OpenSSL master
-            - **Compiler:** GCC ${{ env.GCC_RELEASE }} (official release tarball, SHA-512 verified; bootstrapped from source)
+            - **Compiler:** GCC ${{ env.GCC_RELEASE }} from prebuilt toolchain release ${{ env.GCC_TOOLCHAIN_RELEASE }} (SHA-256 verified; GCC is not compiled in this workflow)
             - **Statically linked:** OpenSSL, Brotli, Zstd, PCRE2, zlib, libcrypt; GCC runtimes are static where applicable.
             - **Dynamic system requirements:** glibc and its ELF loader only.
             - **Compatibility target:** GLIBC 2.39 or older symbol requirements; smoke-tested in Ubuntu 24.04 and Debian 13 (Trixie) containers.
             - **Nginx commit:** `${{ steps.sources.outputs.nginx_commit }}`
             - **OpenSSL commit:** `${{ steps.sources.outputs.openssl_commit }}`
-            - GCC is pinned to stable release 16.2.0. Nginx main and OpenSSL master are moving upstream branches, so those two components are not pinned to stable releases.
+            - GCC is pinned to stable release 16.2.0. The prebuilt toolchain is maintained by tttapa/toolchains (not an Ubuntu package). Nginx main and OpenSSL master are moving upstream branches, so those two components are not pinned to stable releases.
           files: |
             nginx
             nginx-ubuntu24-debian13-amd64.tar.gz
