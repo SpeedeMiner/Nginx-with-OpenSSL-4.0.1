@@ -1,0 +1,169 @@
+name: Build Nginx (main) with OpenSSL (master) & GCC 16
+on: [workflow_dispatch]
+
+permissions:
+  contents: write
+
+env:
+  GCC_VERSION: "16"
+
+jobs:
+  build:
+    # ubuntu-24.04 (GLIBC 2.39) гарантирует работу на Ubuntu 24.04 (2.39) и Debian 13 (2.41)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Install GCC 16 and build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          # 1. Замена зеркал Azure на официальные HTTPS-зеркала Ubuntu (с учетом формата DEB822 в 24.04)
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu/|https://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list /etc/apt/sources.list.d/* || true
+
+          # 2. Обновление и установка базовых утилит
+          sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=10
+          sudo apt-get install -y software-properties-common
+
+          # 3. Подключение PPA со свежими версиями GCC (GCC 16)
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=10
+
+          # 4. Установка GCC 16 и dev-пакетов со статическими (.a) библиотеками
+          sudo apt-get install -y \
+            gcc-${{ env.GCC_VERSION }} \
+            g++-${{ env.GCC_VERSION }} \
+            build-essential \
+            libpcre2-dev \
+            zlib1g-dev \
+            libbrotli-dev \
+            libzstd-dev \
+            git \
+            wget
+
+          # 5. Назначаем GCC 16 компилятором по умолчанию
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-${{ env.GCC_VERSION }} 100 \
+            --slave /usr/bin/g++ g++ /usr/bin/g++-${{ env.GCC_VERSION }} \
+            --slave /usr/bin/gcov gcov /usr/bin/gcov-${{ env.GCC_VERSION }}
+          gcc --version
+
+      - name: Download sources
+        id: sources
+        run: |
+          git clone --depth 1 https://github.com/openssl/openssl.git openssl-main
+          git clone --depth 1 https://github.com/nginx/nginx.git nginx-main
+
+          NGINX_COMMIT=$(git -C nginx-main rev-parse --short HEAD)
+          OPENSSL_COMMIT=$(git -C openssl-main rev-parse --short HEAD)
+          BUILD_DATE=$(date -u +"%Y.%m.%d")
+
+          echo "nginx_commit=${NGINX_COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "openssl_commit=${OPENSSL_COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=v${BUILD_DATE}-${NGINX_COMMIT}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure and Compile Nginx
+        run: |
+          cd nginx-main
+          export CC=gcc-${{ env.GCC_VERSION }}
+          export CXX=g++-${{ env.GCC_VERSION }}
+
+          ./auto/configure \
+            --prefix=/etc/nginx \
+            --sbin-path=/usr/sbin/nginx \
+            --modules-path=/usr/lib/nginx/modules \
+            --conf-path=/etc/nginx/nginx.conf \
+            --error-log-path=/var/log/nginx/error.log \
+            --http-log-path=/var/log/nginx/access.log \
+            --pid-path=/run/nginx.pid \
+            --lock-path=/run/nginx.lock \
+            --http-client-body-temp-path=/var/cache/nginx/client_temp \
+            --http-proxy-temp-path=/var/cache/nginx/proxy_temp \
+            --http-fastcgi-temp-path=/var/cache/nginx/fastcgi_temp \
+            --http-uwsgi-temp-path=/var/cache/nginx/uwsgi_temp \
+            --http-scgi-temp-path=/var/cache/nginx/scgi_temp \
+            --user=nginx \
+            --group=nginx \
+            --with-compat \
+            --with-file-aio \
+            --with-threads \
+            --with-http_addition_module \
+            --with-http_auth_request_module \
+            --with-http_dav_module \
+            --with-http_flv_module \
+            --with-http_gunzip_module \
+            --with-http_gzip_static_module \
+            --with-http_mp4_module \
+            --with-http_random_index_module \
+            --with-http_realip_module \
+            --with-http_secure_link_module \
+            --with-http_slice_module \
+            --with-http_ssl_module \
+            --with-http_stub_status_module \
+            --with-http_sub_module \
+            --with-http_v2_module \
+            --with-http_v3_module \
+            --with-mail \
+            --with-mail_ssl_module \
+            --with-stream \
+            --with-stream_realip_module \
+            --with-stream_ssl_module \
+            --with-stream_ssl_preread_module \
+            --with-openssl=../openssl-main \
+            --with-openssl-opt='no-shared no-tests enable-zlib enable-brotli enable-zstd -fPIC' \
+            --with-cc-opt='-g -O2 -Wno-error -Werror=implicit-function-declaration -fstack-protector-strong -fstack-clash-protection -Wformat -Werror=format-security -fcf-protection -fPIC' \
+            --with-ld-opt='-Wl,-z,relro -Wl,-z,now -pie -static-libgcc -static-libstdc++ -Wl,--as-needed'
+
+          # 1. Переводим PCRE2 на статическую линковку (.a)
+          sed -i 's|-lpcre2-8|-Wl,-Bstatic -lpcre2-8 -Wl,-Bdynamic|g' objs/Makefile
+
+          # 2. Подставляем статические архивы Brotli, Zstd и Zlib строго ПОСЛЕ libssl.a и libcrypto.a
+          sed -i 's|-lpthread -lz|-Wl,-Bstatic -lbrotlienc -lbrotlidec -lbrotlicommon -lzstd -lz -Wl,-Bdynamic -lpthread|g' objs/Makefile
+
+          make -j"$(nproc)"
+
+      - name: Check binary and prepare release assets
+        run: |
+          echo "=== 1. Проверка динамических библиотек (ldd) ==="
+          ldd nginx-main/objs/nginx
+
+          # Автоматическая проверка: падаем, если бинарник требует внешние .so от GCC, Brotli, Zstd, PCRE2 или Zlib
+          if ldd nginx-main/objs/nginx | grep -E "libbrotli|libzstd|libpcre2|libz\.so|libgcc_s|libstdc\+\+"; then
+            echo "ОШИБКА: Обнаружены внешние динамические зависимости!"
+            exit 1
+          fi
+          echo "ОК: Все библиотеки сжатия, регулярных выражений и рантайма GCC 16 вшиты статически."
+
+          echo "=== 2. Проверка требуемых версий GLIBC ==="
+          objdump -p nginx-main/objs/nginx | grep -A 15 "required from libc.so" || true
+
+          echo "=== 3. Информация о сборке Nginx ==="
+          ./nginx-main/objs/nginx -V
+
+          # Копируем бинарник и создаем архив + контрольную сумму для релиза
+          cp nginx-main/objs/nginx ./nginx
+          tar -czf nginx-ubuntu24-debian13-amd64.tar.gz nginx
+          sha256sum nginx nginx-ubuntu24-debian13-amd64.tar.gz > sha256sums.txt
+
+      - name: Upload Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nginx-binary-main
+          path: nginx-main/objs/nginx
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.sources.outputs.tag_name }}
+          name: "Nginx (main: ${{ steps.sources.outputs.nginx_commit }}) + OpenSSL (master: ${{ steps.sources.outputs.openssl_commit }})"
+          body: |
+            ### Сборка Nginx (main) + OpenSSL (master)
+            - **Компилятор:** GCC ${{ env.GCC_VERSION }} (полностью автономный бинарник)
+            - **Статически вшиты:** OpenSSL, Brotli, Zstd, PCRE2, Zlib, libgcc
+            - **Целевые ОС:** Ubuntu 24.04+, Debian 13 (Trixie)+ (GLIBC 2.39+)
+            - **Nginx commit:** `${{ steps.sources.outputs.nginx_commit }}`
+            - **OpenSSL commit:** `${{ steps.sources.outputs.openssl_commit }}`
+          files: |
+            nginx
+            nginx-ubuntu24-debian13-amd64.tar.gz
+            sha256sums.txt
+          draft: false
+          prerelease: false
