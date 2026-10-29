@@ -136,46 +136,78 @@ jobs:
             --with-cc-opt='-g -O2 -Wno-error -Werror=implicit-function-declaration -fstack-protector-strong -fstack-clash-protection -Wformat -Werror=format-security -fcf-protection -fPIC' \
             --with-ld-opt='-Wl,-z,relro -Wl,-z,now -pie -static-libgcc -static-libstdc++ -Wl,--as-needed'
 
-          # Nginx's OpenSSL build is static, but its third-party compression
-          # libraries must also be linked explicitly. Guard every Makefile
-          # rewrite so upstream build changes fail loudly instead of silently
-          # producing a binary with unexpected shared-library dependencies.
-          python3 - <<'PY'
+          # Nginx's OpenSSL build is static, but its optional compression
+          # libraries and the system PCRE2/libcrypt/zlib libraries must also be
+          # linked from static archives. Add them at the END of the final link
+          # command, inside a linker group, so archive order does not matter.
+          # If the upstream Makefile changes, fail instead of silently making
+          # a binary with unexpected shared-library dependencies.
+          MULTIARCH="$(gcc-${{ env.GCC_VERSION }} -print-multiarch)"
+          STATIC_LIB_DIR="/usr/lib/${MULTIARCH}"
+          python3 - "$STATIC_LIB_DIR" <<'PY'
           import re
+          import sys
           from pathlib import Path
+
+          libdir = Path(sys.argv[1])
+          required = (
+              "libpcre2-8.a",
+              "libcrypt.a",
+              "libz.a",
+              "libbrotlienc.a",
+              "libbrotlidec.a",
+              "libbrotlicommon.a",
+              "libzstd.a",
+          )
+          for name in required:
+              path = libdir / name
+              if not path.is_file():
+                  raise SystemExit(f"ERROR: Required static archive missing: {path}")
 
           makefile = Path("objs/Makefile")
           text = makefile.read_text()
 
-          replacements = (
-              (
-                  r"(?<!\S)-lpcre2-8(?!\S)",
-                  "-Wl,-Bstatic -lpcre2-8 -Wl,-Bdynamic",
-                  "PCRE2",
-              ),
-              (
-                  r"(?<!\S)-lcrypt(?!\S)",
-                  "-Wl,-Bstatic -lcrypt -Wl,-Bdynamic",
-                  "libcrypt",
-              ),
-              (
-                  r"(?<!\S)-lpthread\s+-lz(?!\S)",
-                  "-Wl,-Bstatic -lbrotlienc -lbrotlidec -lbrotlicommon "
-                  "-lzstd -lz -Wl,-Bdynamic -lm -lpthread",
-                  "Brotli/Zstd/zlib",
-              ),
-          )
-
-          for pattern, replacement, label in replacements:
-              text, count = re.subn(pattern, replacement, text)
+          # Remove the dynamic library switches emitted by Nginx's configure.
+          # The corresponding .a files are appended at the end below.
+          for token, label in (
+              ("-lpcre2-8", "PCRE2"),
+              ("-lcrypt", "libcrypt"),
+              ("-lz", "zlib"),
+          ):
+              text, count = re.subn(
+                  rf"(?<!\S){re.escape(token)}(?!\S)", "", text
+              )
               if count != 1:
                   raise SystemExit(
-                      f"ERROR: Expected exactly one {label} linker pattern "
+                      f"ERROR: Expected exactly one {token} token for {label} "
                       f"in {makefile}, found {count}. Refusing unsafe link patch."
                   )
 
-          makefile.write_text(text)
-          print("Static-link patches applied and verified.")
+          # Locate the generated final executable link rule, then append static
+          # archives after libssl.a/libcrypto.a and all Nginx objects/libraries.
+          lines = text.splitlines()
+          start = next(
+              (i for i, line in enumerate(lines)
+               if line.lstrip().startswith("$(LINK) -o objs/nginx")),
+              None,
+          )
+          if start is None:
+              raise SystemExit("ERROR: Could not locate the objs/nginx link command")
+
+          end = start
+          while end < len(lines) - 1 and lines[end].rstrip().endswith("\\"):
+              end += 1
+          if lines[end].rstrip().endswith("\\"):
+              raise SystemExit("ERROR: Unterminated objs/nginx link command")
+
+          archives = " ".join(str(libdir / name) for name in required)
+          lines[end] = (
+              lines[end].rstrip()
+              + " -Wl,--start-group " + archives
+              + " -Wl,--end-group -lm"
+          )
+          makefile.write_text("\n".join(lines) + "\n")
+          print("Verified static archives and appended them after Nginx/OpenSSL libraries.")
           PY
 
           make -j"$(nproc)"
@@ -223,6 +255,48 @@ jobs:
 
           echo "=== Nginx build information ==="
           "$BIN" -V 2>&1 | tee nginx-build-info.txt
+
+          # Assert that all built-in modules enabled by the GCC 14 reference
+          # workflow are still present in this GCC 16 build.
+          for flag in \
+            --with-compat \
+            --with-file-aio \
+            --with-threads \
+            --with-http_addition_module \
+            --with-http_auth_request_module \
+            --with-http_dav_module \
+            --with-http_flv_module \
+            --with-http_gunzip_module \
+            --with-http_gzip_static_module \
+            --with-http_mp4_module \
+            --with-http_random_index_module \
+            --with-http_realip_module \
+            --with-http_secure_link_module \
+            --with-http_slice_module \
+            --with-http_ssl_module \
+            --with-http_stub_status_module \
+            --with-http_sub_module \
+            --with-http_v2_module \
+            --with-http_v3_module \
+            --with-mail \
+            --with-mail_ssl_module \
+            --with-stream \
+            --with-stream_realip_module \
+            --with-stream_ssl_module \
+            --with-stream_ssl_preread_module \
+            --with-openssl-opt; do
+            if ! grep -Fq -- "$flag" nginx-build-info.txt; then
+              echo "ERROR: Expected configure flag is missing: $flag" >&2
+              exit 1
+            fi
+          done
+          for feature in enable-zlib enable-brotli enable-zstd; do
+            if ! grep -Fq -- "$feature" nginx-build-info.txt; then
+              echo "ERROR: OpenSSL feature is missing from the build: $feature" >&2
+              exit 1
+            fi
+          done
+          echo "OK: All built-in modules and OpenSSL compression features from the reference workflow are enabled."
 
           cp "$BIN" ./nginx
 
