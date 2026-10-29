@@ -60,7 +60,7 @@ jobs:
           echo "openssl_commit=${OPENSSL_COMMIT}" >> "$GITHUB_OUTPUT"
           echo "tag_name=v${BUILD_DATE}-${NGINX_COMMIT}" >> "$GITHUB_OUTPUT"
 
-      - name: Configure and Compile Nginx
+      - - - name: Configure and Compile Nginx
         run: |
           cd nginx-main
           export CC=gcc-${{ env.GCC_VERSION }}
@@ -110,13 +110,15 @@ jobs:
             --with-openssl=../openssl-main \
             --with-openssl-opt='no-shared no-tests enable-zlib enable-brotli enable-zstd -fPIC' \
             --with-cc-opt='-g -O2 -Wno-error -Werror=implicit-function-declaration -fstack-protector-strong -fstack-clash-protection -Wformat -Werror=format-security -fcf-protection -fPIC' \
-            --with-ld-opt='-Wl,-z,relro -Wl,-z,now -pie -static-libgcc -static-libstdc++ -Wl,--as-needed -Wl,-Bstatic -lpcre2-8 -lbrotlienc -lbrotlidec -lbrotlicommon -lzstd -lz -Wl,-Bdynamic'
+            --with-ld-opt='-Wl,-z,relro -Wl,-z,now -pie -static-libgcc -static-libstdc++ -Wl,--as-needed'
 
-          # Переводим базовые вызовы PCRE2 и Zlib в Makefile Nginx на статическую линковку (.a вместо .so)
-          sed -i 's/-lpcre2-8/-Wl,-Bstatic -lpcre2-8 -Wl,-Bdynamic/g; s/-lz/-Wl,-Bstatic -lz -Wl,-Bdynamic/g' objs/Makefile
+          # 1. Переводим PCRE2 на статическую линковку (.a)
+          sed -i 's|-lpcre2-8|-Wl,-Bstatic -lpcre2-8 -Wl,-Bdynamic|g' objs/Makefile
+
+          # 2. Подставляем статические архивы Brotli, Zstd и Zlib строго ПОСЛЕ libssl.a и libcrypto.a
+          sed -i 's|-lpthread -lz|-Wl,-Bstatic -lbrotlienc -lbrotlidec -lbrotlicommon -lzstd -lz -Wl,-Bdynamic -lpthread|g' objs/Makefile
 
           make -j"$(nproc)"
-
       - name: Check binary and prepare release assets
         run: |
           echo "=== 1. Проверка динамических библиотек (ldd) ==="
