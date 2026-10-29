@@ -1,15 +1,18 @@
-name: Build Nginx (main) with OpenSSL (master) & GCC 16
-on: [workflow_dispatch]
+name: Build Nginx main + OpenSSL master (GCC 16)
+
+on:
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 env:
   GCC_VERSION: "16"
+  TARGET_GLIBC: "2.39"
 
 jobs:
   build:
-    # ubuntu-24.04 (GLIBC 2.39) гарантирует работу на Ubuntu 24.04 (2.39) и Debian 13 (2.41)
+    name: Build amd64 binary
     runs-on: ubuntu-24.04
 
     steps:
@@ -17,54 +20,75 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          # 1. Замена зеркал Azure на официальные HTTPS-зеркала Ubuntu (с учетом формата DEB822 в 24.04)
-          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu/|https://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list /etc/apt/sources.list.d/* || true
+          # GitHub's Ubuntu image may use the Azure mirror in DEB822 sources.
+          sudo find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
+            -exec sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' {} +
 
-          # 2. Обновление и установка базовых утилит
-          sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=10
+          sudo apt-get update -o Acquire::Retries=3 -o Acquire::https::Timeout=15
           sudo apt-get install -y software-properties-common
 
-          # 3. Подключение PPA со свежими версиями GCC (GCC 16)
           sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
-          sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=10
+          sudo apt-get update -o Acquire::Retries=3 -o Acquire::https::Timeout=15
 
-          # 4. Установка GCC 16 и dev-пакетов со статическими (.a) библиотеками
           sudo apt-get install -y \
             gcc-${{ env.GCC_VERSION }} \
             g++-${{ env.GCC_VERSION }} \
             build-essential \
+            binutils \
+            file \
+            git \
+            make \
+            perl \
+            python3 \
+            wget \
+            libcrypt-dev \
             libpcre2-dev \
             zlib1g-dev \
             libbrotli-dev \
-            libzstd-dev \
-            git \
-            wget
+            libzstd-dev
 
-          # 5. Назначаем GCC 16 компилятором по умолчанию
-          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-${{ env.GCC_VERSION }} 100 \
-            --slave /usr/bin/g++ g++ /usr/bin/g++-${{ env.GCC_VERSION }} \
-            --slave /usr/bin/gcov gcov /usr/bin/gcov-${{ env.GCC_VERSION }}
-          gcc --version
+          gcc-${{ env.GCC_VERSION }} --version
+          g++-${{ env.GCC_VERSION }} --version
+          test "$(uname -m)" = "x86_64"
+
+          # Fail early if any required static archive is missing.
+          MULTIARCH="$(gcc-${{ env.GCC_VERSION }} -print-multiarch)"
+          for archive in \
+            "/usr/lib/${MULTIARCH}/libcrypt.a" \
+            "/usr/lib/${MULTIARCH}/libpcre2-8.a" \
+            "/usr/lib/${MULTIARCH}/libbrotlienc.a" \
+            "/usr/lib/${MULTIARCH}/libbrotlidec.a" \
+            "/usr/lib/${MULTIARCH}/libbrotlicommon.a" \
+            "/usr/lib/${MULTIARCH}/libzstd.a" \
+            "/usr/lib/${MULTIARCH}/libz.a"; do
+            if [ ! -f "$archive" ]; then
+              echo "ERROR: Required static archive not found: $archive" >&2
+              exit 1
+            fi
+          done
 
       - name: Download sources
         id: sources
         run: |
+          set -euo pipefail
           git clone --depth 1 https://github.com/openssl/openssl.git openssl-main
           git clone --depth 1 https://github.com/nginx/nginx.git nginx-main
 
-          NGINX_COMMIT=$(git -C nginx-main rev-parse --short HEAD)
-          OPENSSL_COMMIT=$(git -C openssl-main rev-parse --short HEAD)
-          BUILD_DATE=$(date -u +"%Y.%m.%d")
+          NGINX_COMMIT="$(git -C nginx-main rev-parse --short=12 HEAD)"
+          OPENSSL_COMMIT="$(git -C openssl-main rev-parse --short=12 HEAD)"
+          BUILD_DATE="$(date -u +'%Y.%m.%d')"
+          TAG_NAME="v${BUILD_DATE}-${NGINX_COMMIT}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
           echo "nginx_commit=${NGINX_COMMIT}" >> "$GITHUB_OUTPUT"
           echo "openssl_commit=${OPENSSL_COMMIT}" >> "$GITHUB_OUTPUT"
-          echo "tag_name=v${BUILD_DATE}-${NGINX_COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
 
-      - name: Configure and Compile Nginx
+      - name: Configure and compile Nginx
+        working-directory: nginx-main
         run: |
-          cd nginx-main
-          export CC=gcc-${{ env.GCC_VERSION }}
-          export CXX=g++-${{ env.GCC_VERSION }}
+          set -euo pipefail
+          export CC="gcc-${{ env.GCC_VERSION }}"
+          export CXX="g++-${{ env.GCC_VERSION }}"
 
           ./auto/configure \
             --prefix=/etc/nginx \
@@ -112,55 +136,131 @@ jobs:
             --with-cc-opt='-g -O2 -Wno-error -Werror=implicit-function-declaration -fstack-protector-strong -fstack-clash-protection -Wformat -Werror=format-security -fcf-protection -fPIC' \
             --with-ld-opt='-Wl,-z,relro -Wl,-z,now -pie -static-libgcc -static-libstdc++ -Wl,--as-needed'
 
-          # 1. Переводим PCRE2 на статическую линковку (.a)
-          sed -i 's|-lpcre2-8|-Wl,-Bstatic -lpcre2-8 -Wl,-Bdynamic|g' objs/Makefile
+          # Nginx's OpenSSL build is static, but its third-party compression
+          # libraries must also be linked explicitly. Guard every Makefile
+          # rewrite so upstream build changes fail loudly instead of silently
+          # producing a binary with unexpected shared-library dependencies.
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
 
-          # 2. Подставляем статические архивы Brotli, Zstd и Zlib строго ПОСЛЕ libssl.a и libcrypto.a
-          sed -i 's|-lpthread -lz|-Wl,-Bstatic -lbrotlienc -lbrotlidec -lbrotlicommon -lzstd -lz -Wl,-Bdynamic -lpthread|g' objs/Makefile
+          makefile = Path("objs/Makefile")
+          text = makefile.read_text()
+
+          replacements = (
+              (
+                  r"(?<!\S)-lpcre2-8(?!\S)",
+                  "-Wl,-Bstatic -lpcre2-8 -Wl,-Bdynamic",
+                  "PCRE2",
+              ),
+              (
+                  r"(?<!\S)-lcrypt(?!\S)",
+                  "-Wl,-Bstatic -lcrypt -Wl,-Bdynamic",
+                  "libcrypt",
+              ),
+              (
+                  r"(?<!\S)-lpthread\s+-lz(?!\S)",
+                  "-Wl,-Bstatic -lbrotlienc -lbrotlidec -lbrotlicommon "
+                  "-lzstd -lz -Wl,-Bdynamic -lm -lpthread",
+                  "Brotli/Zstd/zlib",
+              ),
+          )
+
+          for pattern, replacement, label in replacements:
+              text, count = re.subn(pattern, replacement, text)
+              if count != 1:
+                  raise SystemExit(
+                      f"ERROR: Expected exactly one {label} linker pattern "
+                      f"in {makefile}, found {count}. Refusing unsafe link patch."
+                  )
+
+          makefile.write_text(text)
+          print("Static-link patches applied and verified.")
+          PY
 
           make -j"$(nproc)"
 
-      - name: Check binary and prepare release assets
+      - name: Verify binary and prepare release assets
         run: |
-          echo "=== 1. Проверка динамических библиотек (ldd) ==="
-          ldd nginx-main/objs/nginx
+          set -euo pipefail
+          BIN="nginx-main/objs/nginx"
 
-          # Автоматическая проверка: падаем, если бинарник требует внешние .so от GCC, Brotli, Zstd, PCRE2 или Zlib
-          if ldd nginx-main/objs/nginx | grep -E "libbrotli|libzstd|libpcre2|libz\.so|libgcc_s|libstdc\+\+"; then
-            echo "ОШИБКА: Обнаружены внешние динамические зависимости!"
+          echo "=== ELF file ==="
+          file "$BIN"
+
+          echo "=== Dynamic dependencies (only glibc and its loader are allowed) ==="
+          ldd "$BIN" | tee ldd.txt
+
+          UNEXPECTED_DEPS="$(ldd "$BIN" | awk '
+            /=>/ { print $1; next }
+            /^\// { n = split($1, part, "/"); print part[n] }
+          ' | grep -Ev '^(libc\.so\.6|libm\.so\.6|libdl\.so\.2|libpthread\.so\.0|librt\.so\.1|ld-linux-x86-64\.so\.2)$' || true)"
+
+          if [ -n "$UNEXPECTED_DEPS" ]; then
+            echo "ERROR: Unexpected dynamic dependencies detected:" >&2
+            printf '%s\n' "$UNEXPECTED_DEPS" >&2
             exit 1
           fi
-          echo "ОК: Все библиотеки сжатия, регулярных выражений и рантайма GCC 16 вшиты статически."
+          echo "OK: No dynamic dependencies beyond glibc components and the ELF loader."
 
-          echo "=== 2. Проверка требуемых версий GLIBC ==="
-          objdump -p nginx-main/objs/nginx | grep -A 15 "required from libc.so" || true
+          echo "=== Maximum required GLIBC symbol version ==="
+          MAX_GLIBC="$(readelf --version-info "$BIN" \
+            | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' \
+            | sed 's/^GLIBC_//' \
+            | sort -Vu \
+            | tail -n 1)"
 
-          echo "=== 3. Информация о сборке Nginx ==="
-          ./nginx-main/objs/nginx -V
+          if [ -z "$MAX_GLIBC" ]; then
+            echo "ERROR: Could not determine the required GLIBC version." >&2
+            exit 1
+          fi
 
-          # Копируем бинарник и создаем архив + контрольную сумму для релиза
-          cp nginx-main/objs/nginx ./nginx
+          echo "Maximum required GLIBC: ${MAX_GLIBC}"
+          if dpkg --compare-versions "$MAX_GLIBC" gt "$TARGET_GLIBC"; then
+            echo "ERROR: Binary requires GLIBC ${MAX_GLIBC}, newer than target ${TARGET_GLIBC}." >&2
+            exit 1
+          fi
+
+          echo "=== Nginx build information ==="
+          "$BIN" -V 2>&1 | tee nginx-build-info.txt
+
+          cp "$BIN" ./nginx
+
+          echo "=== Runtime smoke test: Ubuntu 24.04 ==="
+          docker run --rm --platform linux/amd64 \
+            -v "$PWD/nginx:/tmp/nginx:ro" \
+            ubuntu:24.04 /tmp/nginx -V
+
+          echo "=== Runtime smoke test: Debian 13 (Trixie) ==="
+          docker run --rm --platform linux/amd64 \
+            -v "$PWD/nginx:/tmp/nginx:ro" \
+            debian:trixie-slim /tmp/nginx -V
+
           tar -czf nginx-ubuntu24-debian13-amd64.tar.gz nginx
           sha256sum nginx nginx-ubuntu24-debian13-amd64.tar.gz > sha256sums.txt
 
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: nginx-binary-main
-          path: nginx-main/objs/nginx
+          name: nginx-binary-main-gcc16
+          path: nginx
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.sources.outputs.tag_name }}
-          name: "Nginx (main: ${{ steps.sources.outputs.nginx_commit }}) + OpenSSL (master: ${{ steps.sources.outputs.openssl_commit }})"
+          name: "Nginx mainline (${{ steps.sources.outputs.nginx_commit }}) + OpenSSL master (${{ steps.sources.outputs.openssl_commit }})"
           body: |
-            ### Сборка Nginx (main) + OpenSSL (master)
-            - **Компилятор:** GCC ${{ env.GCC_VERSION }} (полностью автономный бинарник)
-            - **Статически вшиты:** OpenSSL, Brotli, Zstd, PCRE2, Zlib, libgcc
-            - **Целевые ОС:** Ubuntu 24.04+, Debian 13 (Trixie)+ (GLIBC 2.39+)
+            ### Nginx mainline + OpenSSL master
+            - **Compiler:** GCC ${{ env.GCC_VERSION }}
+            - **Statically linked:** OpenSSL, Brotli, Zstd, PCRE2, zlib, libcrypt; GCC runtimes are static where applicable.
+            - **Dynamic system requirements:** glibc and its ELF loader only.
+            - **Compatibility target:** GLIBC 2.39 or older symbol requirements; smoke-tested in Ubuntu 24.04 and Debian 13 (Trixie) containers.
             - **Nginx commit:** `${{ steps.sources.outputs.nginx_commit }}`
             - **OpenSSL commit:** `${{ steps.sources.outputs.openssl_commit }}`
+            - This is a build from moving upstream branches; it is not a stable release build.
           files: |
             nginx
             nginx-ubuntu24-debian13-amd64.tar.gz
